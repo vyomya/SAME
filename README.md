@@ -1,0 +1,1 @@
+## Scaling Audio Models Efficiently: A joint study of Compute Constraints and Optimization Behavior
