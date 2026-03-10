@@ -69,8 +69,8 @@ SUPPORTED_TASKS = ["asr", "translation"]
 # train_split / eval_split can be overridden from CLI.
 BENCHMARK_REGISTRY = {
     "librispeech": {
-        "hf_path":       "openslr/librispeech_asr",
-        "hf_config":     "clean",            # overridden to "other" when split contains "other"
+        "hf_path":       "librispeech_asr",   # ← use this, not openslr/librispeech_asr
+        "hf_config":     "clean",
         "text_column":   "text",
         "language":      "English",
         "default_train": "train.clean.100",
@@ -177,43 +177,28 @@ class WhisperDataCollator:
 # DATASET
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_benchmark_dataset(
-    benchmark: str,
-    split: str,
-    sampling_rate: int = 16_000,
-):
-    """
-    Generic dataset loader driven by BENCHMARK_REGISTRY.
-
-    For librispeech, the HF config ('clean' vs 'other') is inferred
-    from the split name. For all other benchmarks the config is fixed.
-
-    Returns a HuggingFace Dataset with audio resampled to sampling_rate.
-    """
-    if benchmark not in BENCHMARK_REGISTRY:
-        raise ValueError(
-            f"Unknown benchmark '{benchmark}'. "
-            f"Choose from: {list(BENCHMARK_REGISTRY.keys())}"
-        )
+def load_benchmark_dataset(benchmark, split, sampling_rate=16_000):
     info = BENCHMARK_REGISTRY[benchmark]
-    hf_path = info["hf_path"]
 
-    # LibriSpeech needs config derived from split name
     if benchmark == "librispeech":
         config = "clean" if "clean" in split else "other"
+        # LibriSpeech split names use dot notation: "train.clean.100"
+        # HF datasets expects them as-is
+        dataset = load_dataset(
+            "librispeech_asr",
+            config,
+            split=split,
+            trust_remote_code=True,
+        )
     else:
-        config = info["hf_config"]
+        dataset = load_dataset(
+            info["hf_path"],
+            info["hf_config"],
+            split=split,
+            trust_remote_code=True,
+        )
 
-    print(f"Loading {benchmark} [{config}] split={split} ...")
-    dataset = load_dataset(
-        hf_path,
-        config,
-        split=split,
-        trust_remote_code=True,
-    )
-    dataset = dataset.cast_column("audio", Audio(sampling_rate=sampling_rate))
-    return dataset
-
+    return dataset.cast_column("audio", Audio(sampling_rate=sampling_rate))
 
 def prepare_dataset(
     batch,
