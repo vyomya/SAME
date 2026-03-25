@@ -5,25 +5,38 @@ Two modes:
   mode=full  — finetune entire Whisper (enc+dec), all weights
   mode=lora  — LoRA on encoder self-attention + decoder cross-attention
 
+Streaming support:
+  --streaming           stream audio on the fly, zero disk cache
+  --max_train_samples   cap training samples (works with or without streaming)
+  --max_eval_samples    cap eval samples
+
 Can be used standalone OR imported/called by run_experiment.py.
 
-Key audio framing args (set by run_experiment.py):
-  --tokens_per_frame  : LM tokens produced per encoder output frame
-  --total_frames      : total encoder output frames for a max-length audio clip
-  --task              : downstream task name (asr, translation, ...)
-  --benchmark_dataset : which benchmark dataset to use (librispeech, common_voice, ...)
-
 Usage (standalone):
-  python whisper_finetune.py --model_size small --mode full
+  python whisper_finetune.py --model_size small --mode lora --streaming
+  python whisper_finetune.py --model_size small --mode lora --max_train_samples 2000
 
 Usage (called from run_experiment.py):
   python run_experiment.py --task asr --benchmark_dataset librispeech \\
-      --llm_size small --tokens_per_frame 2 --total_frames 1500 \\
-      -- --mode lora --lora_r 64 --batch_size 8
+      --llm_size small --tokens_per_frame 1 --total_frames 1500 \\
+      --streaming -- --mode lora --lora_r 32
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CACHE SETUP — must be before ALL other imports
+# ─────────────────────────────────────────────────────────────────────────────
 import os
+CACHE_DIR = "/fs/nexus-scratch/vyomwal5/anaconda3/envs/asr/hf_cache"
+os.environ["HF_HOME"]               = CACHE_DIR
+os.environ["HF_DATASETS_CACHE"]     = f"{CACHE_DIR}/datasets"
+os.environ["TRANSFORMERS_CACHE"]    = f"{CACHE_DIR}/models"
+os.environ["HUGGINGFACE_HUB_CACHE"] = f"{CACHE_DIR}/hub"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPORTS
+# ─────────────────────────────────────────────────────────────────────────────
 import re
+import torchaudio
 import time
 import json
 import argparse
@@ -31,14 +44,18 @@ import numpy as np
 import torch
 import evaluate
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from functools import partial
+from typing import Any, Dict, List, Optional, Union
 
-from datasets import load_dataset, Audio
+from datasets import (
+    load_dataset,
+    Audio,
+    IterableDataset,
+    Dataset,
+)
 from transformers import (
     WhisperForConditionalGeneration,
     WhisperProcessor,
-    WhisperFeatureExtractor,
-    WhisperTokenizer,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
 )
@@ -61,21 +78,25 @@ WHISPER_SIZES = {
     "large-v3": "openai/whisper-large-v3",
 }
 
-# ── Supported tasks ───────────────────────────────────────────────────────────
 SUPPORTED_TASKS = ["asr", "translation"]
 
 # ── Benchmark dataset registry ────────────────────────────────────────────────
-# Each entry defines how to load the dataset and which column holds the label.
-# train_split / eval_split can be overridden from CLI.
+#
+# LibriSpeech HF split names (librispeech_asr):
+#   clean config : train.100, train.360, validation, test
+#   other config : train.500, validation, test
+#
 BENCHMARK_REGISTRY = {
     "librispeech": {
-        "hf_path":       "librispeech_asr",   # ← use this, not openslr/librispeech_asr
-        "hf_config":     "clean",
+        "hf_path":       "librispeech_asr",
         "text_column":   "text",
         "language":      "English",
-        "default_train": "train.clean.100",
-        "default_eval":  "validation.clean",
-        "default_test":  ["test.clean", "test.other"],
+        "default_train": "train.100",     # clean config
+        "default_eval":  "validation",    # clean config
+        "default_test":  [                # loaded separately per config
+            ("clean", "test"),
+            ("other", "test"),
+        ],
         "task":          "transcribe",
     },
     "common_voice": {
@@ -85,7 +106,7 @@ BENCHMARK_REGISTRY = {
         "language":      "English",
         "default_train": "train",
         "default_eval":  "validation",
-        "default_test":  ["test"],
+        "default_test":  [("en", "test")],
         "task":          "transcribe",
     },
     "fleurs": {
@@ -95,7 +116,7 @@ BENCHMARK_REGISTRY = {
         "language":      "English",
         "default_train": "train",
         "default_eval":  "validation",
-        "default_test":  ["test"],
+        "default_test":  [("en_us", "test")],
         "task":          "transcribe",
     },
     "voxpopuli": {
@@ -105,100 +126,98 @@ BENCHMARK_REGISTRY = {
         "language":      "English",
         "default_train": "train",
         "default_eval":  "validation",
-        "default_test":  ["test"],
+        "default_test":  [("en", "test")],
         "task":          "transcribe",
     },
 }
 
-# LoRA target modules per Whisper component
-# Encoder self-attention:  q_proj, v_proj  (in encoder layers)
-# Decoder self-attention:  q_proj, v_proj  (in decoder layers)
-# Decoder cross-attention: q_proj, v_proj  (encoder_attn in decoder layers)
-LORA_TARGET_MODULES = [
-    # encoder self-attention
-    "encoder.layers.*.self_attn.q_proj",
-    "encoder.layers.*.self_attn.v_proj",
-    # decoder self-attention
-    "decoder.layers.*.self_attn.q_proj",
-    "decoder.layers.*.self_attn.v_proj",
-    # decoder cross-attention  ← key for seq2seq
-    "decoder.layers.*.encoder_attn.q_proj",
-    "decoder.layers.*.encoder_attn.v_proj",
-]
-
-# Simplified module names (PEFT matches by suffix)
-LORA_TARGET_MODULES_SIMPLE = [
-    "q_proj",
-    "v_proj",
-]
+# LoRA: apply to q_proj and v_proj across all attention layers
+# (encoder self-attn, decoder self-attn, decoder cross-attn)
+LORA_TARGET_MODULES = ["q_proj", "v_proj"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATA COLLATOR
+# DATASET LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass
-class WhisperDataCollator:
+def _librispeech_config_for_split(split: str) -> str:
     """
-    Pads input features and label token ids.
-    Labels are padded with -100 so padding positions are
-    ignored in the cross-entropy loss.
+    Derive the HF config ('clean' or 'other') from the split name.
+      train.100, train.360, validation, test  → clean
+      train.500                               → other
     """
-    processor: Any
+    return "other" if "500" in split else "clean"
 
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # ── Audio features ────────────────────────────────────────────────────
-        # Each feature is already (128, 3000) from WhisperFeatureExtractor
-        input_features = [{"input_features": f["input_features"]} for f in features]
-        batch = self.processor.feature_extractor.pad(
-            input_features, return_tensors="pt"
+
+def load_benchmark_dataset(
+    benchmark:       str,
+    split:           str,
+    sampling_rate:   int  = 16_000,
+    streaming:       bool = False,
+    max_samples:     Optional[int] = None,
+    config_override: Optional[str] = None,
+) -> Union[Dataset, IterableDataset]:
+    """
+    Load a benchmark dataset split.
+
+    Args:
+        benchmark       : key in BENCHMARK_REGISTRY
+        split           : split name (e.g. 'train.100', 'validation', 'test')
+        sampling_rate   : resample audio to this rate (ignored in streaming mode
+                          — resampling happens per-sample in prepare_dataset)
+        streaming       : if True, stream audio on the fly with zero disk cache.
+                          Returns an IterableDataset instead of a Dataset.
+        max_samples     : cap the number of samples. Uses .take() for streaming,
+                          .select() for non-streaming.
+        config_override : force a specific HF config (e.g. 'other' for librispeech)
+    """
+    if benchmark not in BENCHMARK_REGISTRY:
+        raise ValueError(
+            f"Unknown benchmark '{benchmark}'. "
+            f"Choose from: {list(BENCHMARK_REGISTRY.keys())}"
         )
-
-        # ── Labels (token ids) ────────────────────────────────────────────────
-        label_features = [{"input_ids": f["labels"]} for f in features]
-        labels_batch = self.processor.tokenizer.pad(
-            label_features, return_tensors="pt"
-        )
-
-        # Replace tokenizer pad_token_id with -100 (ignored in CE loss)
-        labels = labels_batch["input_ids"].masked_fill(
-            labels_batch.attention_mask.ne(1), -100
-        )
-
-        # Strip BOS token prepended by tokenizer if present
-        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all():
-            labels = labels[:, 1:]
-
-        batch["labels"] = labels
-        return batch
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DATASET
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_benchmark_dataset(benchmark, split, sampling_rate=16_000):
     info = BENCHMARK_REGISTRY[benchmark]
 
-    if benchmark == "librispeech":
-        config = "clean" if "clean" in split else "other"
-        # LibriSpeech split names use dot notation: "train.clean.100"
-        # HF datasets expects them as-is
-        dataset = load_dataset(
-            "librispeech_asr",
-            config,
-            split=split,
-            trust_remote_code=True,
-        )
+    # Resolve config
+    if config_override is not None:
+        config = config_override
+    elif benchmark == "librispeech":
+        config = _librispeech_config_for_split(split)
     else:
-        dataset = load_dataset(
-            info["hf_path"],
-            info["hf_config"],
-            split=split,
-            trust_remote_code=True,
-        )
+        config = info["hf_config"]
 
-    return dataset.cast_column("audio", Audio(sampling_rate=sampling_rate))
+    print(
+        f"Loading {benchmark} [{config}] split={split} "
+        f"{'(streaming)' if streaming else '(cached)'}"
+        + (f" max_samples={max_samples}" if max_samples else "")
+    )
+
+    dataset = load_dataset(
+        info["hf_path"],
+        config,
+        split=split,
+        streaming=streaming,
+        trust_remote_code=True,
+    )
+
+    # Cap samples
+    if max_samples is not None:
+        if streaming:
+            dataset = dataset.take(max_samples)      # IterableDataset
+        else:
+            n = min(max_samples, len(dataset))
+            dataset = dataset.select(range(n))       # Dataset
+
+    # Cast audio column for non-streaming (streaming resamples on-the-fly)
+    if not streaming:
+        dataset = dataset.cast_column("audio", Audio(sampling_rate=sampling_rate))
+
+    return dataset
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PREPROCESSING
+# ─────────────────────────────────────────────────────────────────────────────
 
 def prepare_dataset(
     batch,
@@ -207,42 +226,40 @@ def prepare_dataset(
     max_label_len:    int = 448,
     tokens_per_frame: int = 1,
     total_frames:     int = 1500,
+    sampling_rate:    int = 16_000,
 ):
     """
-    Map function: converts raw audio + text into model inputs.
+    Converts a single sample's raw audio + transcript into model inputs.
 
-    Args:
-        text_column      : column name for transcript (varies by benchmark)
-        max_label_len    : max decoder token sequence length
-        tokens_per_frame : expected LM tokens per encoder output frame.
-                           Used to derive a dynamic max_label_len if the
-                           caller hasn't set one explicitly:
-                             max_label_len = total_frames * tokens_per_frame
-                           This ensures the label budget matches the audio
-                           capacity of the encoder.
-        total_frames     : encoder output frames for a max-length audio clip.
-                           Whisper's CNN compresses 3000 mel frames → 1500
-                           encoder frames for 30s audio.
+    Works for both streaming (IterableDataset) and non-streaming (Dataset).
+    For streaming, audio resampling is done here since cast_column is not
+    available on IterableDataset at load time.
 
-    Whisper STFT config (fixed, built into WhisperFeatureExtractor):
-      n_fft=400  (25ms window @ 16kHz)
-      hop=160    (10ms hop    @ 16kHz)
-      n_mels=128
-      → CNN 2× stride → 1500 encoder frames per 30s clip
+    Whisper STFT (built into WhisperFeatureExtractor):
+      n_fft=400 (25ms @ 16kHz), hop=160 (10ms), n_mels=128
+      → 2× CNN stride → 1500 encoder frames for 30s audio
     """
     audio = batch["audio"]
+    audio_array = audio["array"]
+    audio_sr    = audio["sampling_rate"]
 
-    # Derive label length from audio framing if not explicitly overridden
-    derived_max = total_frames * tokens_per_frame
-    effective_max = min(max_label_len, derived_max)
+    # Resample if needed (important for streaming where cast_column wasn't called)
+    if audio_sr != sampling_rate:
+        
+        waveform = torch.tensor(audio_array).unsqueeze(0)
+        resampler = torchaudio.transforms.Resample(audio_sr, sampling_rate)
+        audio_array = resampler(waveform).squeeze(0).numpy()
 
     # Log-mel spectrogram: (128, 3000)
     batch["input_features"] = processor.feature_extractor(
-        audio["array"],
-        sampling_rate=audio["sampling_rate"],
+        audio_array.astype(np.float32),
+        sampling_rate=sampling_rate,
     ).input_features[0]
 
-    # Tokenize transcript — lowercase for English ASR convention
+    # Derive label budget from audio framing
+    effective_max = min(max_label_len, total_frames * tokens_per_frame)
+
+    # Tokenize transcript
     transcript = batch[text_column]
     if isinstance(transcript, str):
         transcript = transcript.lower()
@@ -256,15 +273,97 @@ def prepare_dataset(
     return batch
 
 
+def apply_preprocessing(
+    dataset:          Union[Dataset, IterableDataset],
+    processor,
+    text_column:      str,
+    max_label_len:    int,
+    tokens_per_frame: int,
+    total_frames:     int,
+    num_proc:         int = 1,
+    sampling_rate:    int = 16_000,
+) -> Union[Dataset, IterableDataset]:
+    """
+    Apply prepare_dataset to a full dataset.
+
+    Handles the key difference between Dataset and IterableDataset:
+      - Dataset       : .map() supports num_proc for parallel processing
+      - IterableDataset: .map() is single-threaded, no num_proc, no remove_columns
+                         by name (must pass column names explicitly or use
+                         batched=False with remove_columns=None)
+    """
+    map_fn = partial(
+        prepare_dataset,
+        processor=processor,
+        text_column=text_column,
+        max_label_len=max_label_len,
+        tokens_per_frame=tokens_per_frame,
+        total_frames=total_frames,
+        sampling_rate=sampling_rate,
+    )
+
+    if isinstance(dataset, IterableDataset):
+        # Streaming: single-threaded map, keep only needed columns
+        dataset = dataset.map(
+            map_fn,
+            remove_columns=["file", "audio", text_column,
+                             "speaker_id", "chapter_id", "id"],
+        )
+    else:
+        # Cached: parallel map with num_proc
+        dataset = dataset.map(
+            map_fn,
+            remove_columns=dataset.column_names,
+            num_proc=num_proc,
+            desc="Preprocessing",
+        )
+
+    return dataset
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA COLLATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class WhisperDataCollator:
+    """
+    Pads input_features and labels into batches.
+    Labels padded with -100 so padding is ignored in cross-entropy loss.
+    Works identically for streaming and non-streaming datasets since by the
+    time the collator sees data, it's already been preprocessed into tensors.
+    """
+    processor: Any
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # Audio features — already (128, 3000), just stack
+        input_features = [{"input_features": f["input_features"]} for f in features]
+        batch = self.processor.feature_extractor.pad(
+            input_features, return_tensors="pt"
+        )
+
+        # Labels — pad with -100
+        label_features = [{"input_ids": f["labels"]} for f in features]
+        labels_batch = self.processor.tokenizer.pad(
+            label_features, return_tensors="pt"
+        )
+        labels = labels_batch["input_ids"].masked_fill(
+            labels_batch.attention_mask.ne(1), -100
+        )
+
+        # Strip BOS if tokenizer prepended it
+        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all():
+            labels = labels[:, 1:]
+
+        batch["labels"] = labels
+        return batch
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # METRICS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_compute_metrics(processor):
-    """
-    Returns a compute_metrics function compatible with Seq2SeqTrainer.
-    Applies simple normalization before WER computation.
-    """
     wer_metric = evaluate.load("wer")
 
     def normalize(text: str) -> str:
@@ -274,10 +373,8 @@ def make_compute_metrics(processor):
         return text
 
     def compute_metrics(pred):
-        pred_ids   = pred.predictions
-        label_ids  = pred.label_ids
-
-        # Replace -100 back to pad_token_id for decoding
+        pred_ids  = pred.predictions
+        label_ids = pred.label_ids
         label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
         pred_str  = processor.tokenizer.batch_decode(pred_ids,  skip_special_tokens=True)
@@ -297,65 +394,42 @@ def make_compute_metrics(processor):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_model_full(model_name: str) -> WhisperForConditionalGeneration:
-    """
-    Load full Whisper model — all weights trainable.
-    All encoder + decoder parameters will be updated during training.
-    """
-    print(f"Loading {model_name} (full finetune mode)...")
+    """All weights trainable."""
+    print(f"Loading {model_name} (full finetune)...")
     model = WhisperForConditionalGeneration.from_pretrained(model_name)
-
-    # Disable Whisper's built-in forced_decoder_ids during training
-    # (these force specific language/task tokens; we handle this via processor)
     model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
-    model.config.use_cache = False  # required for gradient checkpointing
-
+    model.config.suppress_tokens    = []
+    model.config.use_cache          = False   # required for gradient checkpointing
     total = sum(p.numel() for p in model.parameters())
     print(f"  Total params: {total:,} | All trainable")
     return model
 
 
 def build_model_lora(
-    model_name: str,
-    lora_r: int = 32,
-    lora_alpha: int = 64,
+    model_name:   str,
+    lora_r:       int   = 32,
+    lora_alpha:   int   = 64,
     lora_dropout: float = 0.05,
 ) -> WhisperForConditionalGeneration:
     """
-    Load Whisper with LoRA adapters on:
-      - Encoder self-attention: q_proj, v_proj
-      - Decoder self-attention: q_proj, v_proj
-      - Decoder cross-attention: q_proj, v_proj  (encoder_attn)
-
-    Why these layers?
-      - q_proj and v_proj carry the most task-specific information
-      - Cross-attention layers are critical for seq2seq — they control
-        how the decoder attends to audio representations
-      - k_proj and out_proj contribute less and can stay frozen
-
-    Why LoRA over full finetuning?
-      - Reduces trainable params from ~1.5B (large-v3) to ~15M (~1%)
-      - Prevents catastrophic forgetting of general speech knowledge
-      - Fits large models on smaller GPUs (24GB instead of 80GB)
-      - Near-identical WER to full finetuning on in-domain data
+    LoRA on q_proj + v_proj across:
+      encoder self-attn, decoder self-attn, decoder cross-attn (encoder_attn).
+    Reduces trainable params to ~1% while preserving general speech knowledge.
     """
-    print(f"Loading {model_name} (LoRA mode, r={lora_r}, alpha={lora_alpha})...")
+    print(f"Loading {model_name} (LoRA r={lora_r}, alpha={lora_alpha})...")
     model = WhisperForConditionalGeneration.from_pretrained(model_name)
-
     model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
-    model.config.use_cache = False
+    model.config.suppress_tokens    = []
+    model.config.use_cache          = False
 
-    lora_config = LoraConfig(
+    lora_cfg = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        # PEFT matches these by suffix against all Linear layer names
-        target_modules=LORA_TARGET_MODULES_SIMPLE,
+        target_modules=LORA_TARGET_MODULES,
         bias="none",
     )
-
-    model = get_peft_model(model, lora_config)
+    model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
     return model
 
@@ -365,58 +439,70 @@ def build_model_lora(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(args):
-    # Resolve benchmark info
-    benchmark = getattr(args, "benchmark_dataset", "librispeech")
-    task      = getattr(args, "task",              "asr")
+    # ── Resolve benchmark / task config ──────────────────────────────────────
+    benchmark  = getattr(args, "benchmark_dataset", "librispeech")
+    task       = getattr(args, "task",              "asr")
     bench_info = BENCHMARK_REGISTRY.get(benchmark, BENCHMARK_REGISTRY["librispeech"])
 
-    # Fall back to benchmark defaults if splits not explicitly provided
-    train_split = getattr(args, "train_split", None) or bench_info["default_train"]
-    eval_split  = getattr(args, "eval_split",  None) or bench_info["default_eval"]
-    text_column = bench_info["text_column"]
-    language    = bench_info["language"]
-    whisper_task = bench_info["task"]
-
-    # Audio framing params
+    train_split      = getattr(args, "train_split", None) or bench_info["default_train"]
+    eval_split       = getattr(args, "eval_split",  None) or bench_info["default_eval"]
+    text_column      = bench_info["text_column"]
+    language         = bench_info["language"]
+    whisper_task     = bench_info["task"]
     tokens_per_frame = getattr(args, "tokens_per_frame", 1)
     total_frames     = getattr(args, "total_frames",     1500)
+
+    # ── Streaming / sample cap args ───────────────────────────────────────────
+    streaming         = getattr(args, "streaming",          False)
+    max_train_samples = getattr(args, "max_train_samples",  None)
+    max_eval_samples  = getattr(args, "max_eval_samples",   None)
 
     model_name = WHISPER_SIZES[args.model_size]
     run_name   = f"whisper-{args.model_size}-{args.mode}-{benchmark}-{task}"
     output_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(output_dir, exist_ok=True)
 
+    print(f"\nCache directory : {CACHE_DIR}")
+    print(f"Streaming mode  : {streaming}")
+    if max_train_samples:
+        print(f"Max train samples: {max_train_samples}")
+    if max_eval_samples:
+        print(f"Max eval  samples: {max_eval_samples}")
+
     # ── Processor ─────────────────────────────────────────────────────────────
     processor = WhisperProcessor.from_pretrained(
         model_name, language=language, task=whisper_task
     )
 
-    # ── Dataset ────────────────────────────────────────────────────────────────
-    train_dataset = load_benchmark_dataset(benchmark, train_split)
-    eval_dataset  = load_benchmark_dataset(benchmark, eval_split)
+    # ── Load datasets ─────────────────────────────────────────────────────────
+    train_dataset = load_benchmark_dataset(
+        benchmark, train_split,
+        streaming=streaming,
+        max_samples=max_train_samples,
+    )
+    eval_dataset = load_benchmark_dataset(
+        benchmark, eval_split,
+        streaming=streaming,
+        max_samples=max_eval_samples,
+    )
 
-    print("Preprocessing datasets (extracting features + tokenizing)...")
-
-    map_fn = lambda b: prepare_dataset(
-        b,
-        processor,
+    # ── Preprocess ────────────────────────────────────────────────────────────
+    print("Preprocessing datasets...")
+    train_dataset = apply_preprocessing(
+        train_dataset, processor,
         text_column=text_column,
         max_label_len=args.max_label_len,
         tokens_per_frame=tokens_per_frame,
         total_frames=total_frames,
+        num_proc=args.num_proc if not streaming else 1,
     )
-
-    train_dataset = train_dataset.map(
-        map_fn,
-        remove_columns=train_dataset.column_names,
-        num_proc=args.num_proc,
-        desc="Train",
-    )
-    eval_dataset = eval_dataset.map(
-        map_fn,
-        remove_columns=eval_dataset.column_names,
-        num_proc=args.num_proc,
-        desc="Eval",
+    eval_dataset = apply_preprocessing(
+        eval_dataset, processor,
+        text_column=text_column,
+        max_label_len=args.max_label_len,
+        tokens_per_frame=tokens_per_frame,
+        total_frames=total_frames,
+        num_proc=args.num_proc if not streaming else 1,
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -430,63 +516,53 @@ def train(args):
             lora_dropout=args.lora_dropout,
         )
     else:
-        raise ValueError(f"Unknown mode: {args.mode}. Choose 'full' or 'lora'.")
+        raise ValueError(f"Unknown mode '{args.mode}'. Choose 'full' or 'lora'.")
 
-    # ── Data collator ─────────────────────────────────────────────────────────
     collator = WhisperDataCollator(processor=processor)
 
     # ── Training arguments ────────────────────────────────────────────────────
     #
-    # Key decisions:
-    #   - predict_with_generate=True: use model.generate() at eval time
-    #     (greedy decoding) instead of teacher-forced logits — gives real WER
-    #   - generation_max_length: cap decode length
-    #   - gradient_checkpointing: trade compute for memory (essential for large)
-    #   - fp16: half precision on GPU
-    #   - eval_steps / save_steps: evaluate every N steps, save best checkpoint
+    # Streaming notes:
+    #   - evaluation_strategy must be "steps" (not "epoch") for IterableDataset
+    #   - load_best_model_at_end=False for streaming (can't rewind IterableDataset)
+    #   - dataloader_num_workers should be 0 for streaming to avoid pipe errors
     #
+    is_streaming = isinstance(train_dataset, IterableDataset)
+
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
 
-        # Batch size & accumulation
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
 
-        # Learning rate
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
         lr_scheduler_type="linear",
 
-        # Training length
-        max_steps=args.max_steps,          # use max_steps OR num_train_epochs
-        # num_train_epochs=args.num_epochs, # uncomment to use epochs instead
+        max_steps=args.max_steps,
 
-        # Precision & memory
         fp16=args.fp16 and torch.cuda.is_available(),
         gradient_checkpointing=True,
 
-        # Evaluation
-        evaluation_strategy="steps",
+        eval_strategy="steps",       # required for streaming
         eval_steps=args.eval_steps,
         predict_with_generate=True,
         generation_max_length=args.max_label_len,
 
-        # Saving
         save_strategy="steps",
         save_steps=args.eval_steps,
         save_total_limit=2,
-        load_best_model_at_end=True,
+        load_best_model_at_end=not is_streaming,   # False for streaming
         metric_for_best_model="wer",
         greater_is_better=False,
 
-        # Logging
         logging_steps=args.log_steps,
         report_to=["tensorboard"],
         run_name=run_name,
 
-        # Misc
-        dataloader_num_workers=args.num_proc,
+        # Use 0 workers for streaming to avoid DataLoader pipe errors
+        dataloader_num_workers=0 if is_streaming else args.num_proc,
         remove_unused_columns=False,
     )
 
@@ -498,40 +574,43 @@ def train(args):
         eval_dataset=eval_dataset,
         data_collator=collator,
         compute_metrics=make_compute_metrics(processor),
-        tokenizer=processor.feature_extractor,
+        processing_class=processor.feature_extractor,
     )
 
-    # ── Train ─────────────────────────────────────────────────────────────────
+    # ── Print summary ─────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"  Run: {run_name}")
-    print(f"  Train samples: {len(train_dataset)}")
-    print(f"  Eval  samples: {len(eval_dataset)}")
+    print(f"  Run     : {run_name}")
+    print(f"  Mode    : {args.mode} | Streaming: {is_streaming}")
+    if not is_streaming:
+        print(f"  Train   : {len(train_dataset):,} samples")
+        print(f"  Eval    : {len(eval_dataset):,} samples")
     print(f"{'='*60}\n")
 
+    # ── Train ─────────────────────────────────────────────────────────────────
     t0 = time.time()
     trainer.train()
     elapsed = time.time() - t0
     print(f"\nTraining complete in {elapsed/3600:.2f}h")
 
-    # ── Save final model ──────────────────────────────────────────────────────
+    # ── Save ──────────────────────────────────────────────────────────────────
     if args.mode == "lora":
-        # Save only LoRA adapter weights (small — ~50MB for large-v3)
         model.save_pretrained(output_dir)
     else:
         trainer.save_model(output_dir)
-
     processor.save_pretrained(output_dir)
 
-    # ── Save run metadata for sweep analysis ─────────────────────────────────
+    # ── Run metadata ──────────────────────────────────────────────────────────
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
     meta = {
         "model_size":        args.model_size,
         "mode":              args.mode,
-        "task":              getattr(args, "task", "asr"),
-        "benchmark_dataset": getattr(args, "benchmark_dataset", "librispeech"),
-        "tokens_per_frame":  getattr(args, "tokens_per_frame", 1),
-        "total_frames":      getattr(args, "total_frames", 1500),
+        "task":              task,
+        "benchmark_dataset": benchmark,
+        "tokens_per_frame":  tokens_per_frame,
+        "total_frames":      total_frames,
+        "streaming":         is_streaming,
+        "max_train_samples": max_train_samples,
         "lora_r":            args.lora_r if args.mode == "lora" else None,
         "train_split":       train_split,
         "trainable_params":  trainable,
@@ -547,29 +626,38 @@ def train(args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EVALUATION (standalone — load checkpoint and run full test set)
+# EVALUATION
 # ─────────────────────────────────────────────────────────────────────────────
+
+def normalize_text(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\s\']", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
 
 def evaluate_checkpoint(args):
     """
-    Load a saved checkpoint and run evaluation on LibriSpeech test sets.
-    Logs WER, RTF (real-time factor), and parameter counts.
-
-    Real-Time Factor (RTF) = inference_time / audio_duration
-      RTF < 1.0 means faster than real-time (good for production)
+    Load a saved checkpoint and run WER + RTF evaluation on test splits.
+    Always streams eval data to avoid disk usage.
     """
     checkpoint_dir = args.checkpoint
     assert checkpoint_dir, "--checkpoint required for eval_only mode"
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_name = WHISPER_SIZES[args.model_size]
+    benchmark  = getattr(args, "benchmark_dataset", "librispeech")
+    bench_info = BENCHMARK_REGISTRY.get(benchmark, BENCHMARK_REGISTRY["librispeech"])
+    text_column = bench_info["text_column"]
 
     # ── Load processor ────────────────────────────────────────────────────────
+    proc_path = (
+        checkpoint_dir
+        if os.path.exists(os.path.join(checkpoint_dir, "preprocessor_config.json"))
+        else model_name
+    )
     processor = WhisperProcessor.from_pretrained(
-        checkpoint_dir if os.path.exists(os.path.join(checkpoint_dir, "preprocessor_config.json"))
-        else model_name,
-        language="English",
-        task="transcribe",
+        proc_path, language="English", task="transcribe"
     )
 
     # ── Load model ────────────────────────────────────────────────────────────
@@ -577,78 +665,80 @@ def evaluate_checkpoint(args):
         base = WhisperForConditionalGeneration.from_pretrained(model_name)
         base.config.forced_decoder_ids = None
         model = PeftModel.from_pretrained(base, checkpoint_dir)
-        model = model.merge_and_unload()   # merge LoRA into base weights for fast inference
+        model = model.merge_and_unload()
     else:
         model = WhisperForConditionalGeneration.from_pretrained(checkpoint_dir)
 
     model.config.forced_decoder_ids = None
     model = model.to(device).eval()
 
-    # ── Eval datasets — use benchmark registry ────────────────────────────────
-    benchmark  = getattr(args, "benchmark_dataset", "librispeech")
-    bench_info = BENCHMARK_REGISTRY.get(benchmark, BENCHMARK_REGISTRY["librispeech"])
-    test_splits = bench_info["default_test"]
-
-    eval_splits = {
-        split: load_benchmark_dataset(benchmark, split)
-        for split in test_splits
-    }
+    # ── Load test splits (always streaming for eval — no disk needed) ─────────
+    # librispeech needs separate loads for clean vs other
+    if benchmark == "librispeech":
+        eval_splits = {
+            "test_clean": load_benchmark_dataset(
+                benchmark, "test", streaming=True, config_override="clean",
+                max_samples=getattr(args, "max_eval_samples", None),
+            ),
+            "test_other": load_benchmark_dataset(
+                benchmark, "test", streaming=True, config_override="other",
+                max_samples=getattr(args, "max_eval_samples", None),
+            ),
+        }
+    else:
+        eval_splits = {}
+        for config, split in bench_info["default_test"]:
+            key = f"{config}_{split}"
+            eval_splits[key] = load_benchmark_dataset(
+                benchmark, split, streaming=True,
+                max_samples=getattr(args, "max_eval_samples", None),
+            )
 
     wer_metric = evaluate.load("wer")
-    results = {}
+    results    = {}
 
     for split_name, dataset in eval_splits.items():
-        print(f"\nEvaluating on {split_name} ({len(dataset)} samples)...")
-
+        print(f"\nEvaluating on {split_name} ...")
         all_preds, all_refs = [], []
         total_audio_s = 0.0
         total_infer_s = 0.0
 
         for sample in tqdm.tqdm(dataset):
             audio_array = sample["audio"]["array"].astype(np.float32)
-            ref_text    = sample["text"].lower().strip()
+            ref_text    = sample[text_column].lower().strip()
             audio_dur_s = len(audio_array) / 16_000
 
-            # Feature extraction
             features = processor.feature_extractor(
                 audio_array, sampling_rate=16_000, return_tensors="pt"
             ).input_features.to(device)
 
-            # Timed inference
             t0 = time.time()
             with torch.no_grad():
                 pred_ids = model.generate(
                     features,
                     language="en",
                     task="transcribe",
-                    num_beams=1,        # greedy — use num_beams=5 for best WER
+                    num_beams=1,
                     max_new_tokens=256,
                 )
             infer_time = time.time() - t0
 
             pred_text = processor.tokenizer.decode(pred_ids[0], skip_special_tokens=True)
-
-            # Normalize
-            pred_text = normalize_text(pred_text)
-            ref_text  = normalize_text(ref_text)
-
-            all_preds.append(pred_text)
-            all_refs.append(ref_text)
+            all_preds.append(normalize_text(pred_text))
+            all_refs.append(normalize_text(ref_text))
             total_audio_s += audio_dur_s
             total_infer_s += infer_time
 
         wer = wer_metric.compute(predictions=all_preds, references=all_refs)
         rtf = total_infer_s / total_audio_s
-
         results[split_name] = {
             "wer":           round(100 * wer, 3),
             "rtf":           round(rtf, 4),
+            "n_samples":     len(all_preds),
             "total_audio_h": round(total_audio_s / 3600, 2),
-            "total_infer_h": round(total_infer_s / 3600, 2),
         }
         print(f"  WER: {results[split_name]['wer']:.3f}% | RTF: {rtf:.4f}")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     total_params = sum(p.numel() for p in model.parameters())
     summary = {
         "model_size":   args.model_size,
@@ -658,7 +748,6 @@ def evaluate_checkpoint(args):
     }
     print("\n" + "="*60)
     print(json.dumps(summary, indent=2))
-    print("="*60)
 
     out_path = os.path.join(checkpoint_dir, "eval_results.json")
     with open(out_path, "w") as f:
@@ -667,41 +756,18 @@ def evaluate_checkpoint(args):
     return summary
 
 
-def normalize_text(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9\s\']", "", text)
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# SWEEP RUNNER  (compute vs WER across model sizes and modes)
+# SWEEP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_sweep(args):
-    """
-    Run a full grid sweep over model sizes × modes and collect results.
-    Saves a combined sweep_results.json for plotting compute vs WER curves.
-
-    Compute proxy metrics logged per run:
-      - trainable_params     : params updated during training
-      - total_params         : total model params (proxy for inference VRAM)
-      - training_hours       : wall-clock training time
-      - rtf (test.clean)     : real-time factor (inference speed)
-      - wer (test.clean/other): accuracy
-    """
-    sizes = args.sweep_sizes.split(",")   # e.g. "small,medium,large-v3"
-    modes = args.sweep_modes.split(",")   # e.g. "full,lora"
-
+    sizes = args.sweep_sizes.split(",")
+    modes = args.sweep_modes.split(",")
     all_results = []
 
     for size in sizes:
         for mode in modes:
-            print(f"\n{'#'*60}")
-            print(f"  SWEEP: whisper-{size} | mode={mode}")
-            print(f"{'#'*60}")
-
-            # Temporarily override args for this run
+            print(f"\n{'#'*60}\n  SWEEP: whisper-{size} | mode={mode}\n{'#'*60}")
             args.model_size = size
             args.mode       = mode
 
@@ -711,33 +777,28 @@ def run_sweep(args):
                     model_size=size,
                     mode=mode,
                     checkpoint=checkpoint_dir,
+                    benchmark_dataset=getattr(args, "benchmark_dataset", "librispeech"),
+                    max_eval_samples=getattr(args, "max_eval_samples", None),
                 )
             )
 
-            # Load run metadata
             meta_path = os.path.join(checkpoint_dir, "run_meta.json")
             with open(meta_path) as f:
                 meta = json.load(f)
 
-            combined = {**meta, **eval_summary["results"]}
-            all_results.append(combined)
+            all_results.append({**meta, **eval_summary["results"]})
 
-            # Save incrementally
             sweep_path = os.path.join(args.output_dir, "sweep_results.json")
             with open(sweep_path, "w") as f:
                 json.dump(all_results, f, indent=2)
-            print(f"\nSweep results so far saved to {sweep_path}")
+            print(f"Sweep results saved to {sweep_path}")
 
-    print("\n" + "="*60)
-    print("SWEEP COMPLETE")
-    print("="*60)
+    print("\n" + "="*60 + "\nSWEEP COMPLETE\n" + "="*60)
     for r in all_results:
-        clean_wer = r.get("test.clean", {}).get("wer", "N/A")
-        other_wer = r.get("test.other", {}).get("wer", "N/A")
         print(
             f"  whisper-{r['model_size']:10s} | {r['mode']:5s} | "
-            f"params={r['trainable_params']:>12,} | "
-            f"test.clean WER={clean_wer}% | test.other WER={other_wer}%"
+            f"trainable={r['trainable_params']:>12,} | "
+            f"WER test_clean={r.get('test_clean', {}).get('wer', 'N/A')}%"
         )
 
 
@@ -747,77 +808,57 @@ def run_sweep(args):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Whisper Finetuning: full vs LoRA, multi-benchmark",
+        description="Whisper Finetuning: full vs LoRA, multi-benchmark, streaming",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Experiment identity (set by run_experiment.py or manually) ────────────
-    p.add_argument("--task", type=str, default="asr",
-                   choices=SUPPORTED_TASKS,
-                   help="Downstream task")
-    p.add_argument("--benchmark_dataset", type=str, default="librispeech",
-                   choices=list(BENCHMARK_REGISTRY.keys()),
-                   help="Benchmark dataset to train and evaluate on")
-    p.add_argument("--tokens_per_frame", type=int, default=1,
-                   help=(
-                       "Expected LM tokens per encoder output frame. "
-                       "Used to derive max_label_len = total_frames * tokens_per_frame. "
-                       "Typical: 1 for English ASR (1 token ≈ 1 frame), "
-                       "2-3 for morphologically rich languages."
-                   ))
-    p.add_argument("--total_frames", type=int, default=1500,
-                   help=(
-                       "Encoder output frames for max-length audio. "
-                       "Whisper: 3000 mel frames → 1500 after 2× CNN stride. "
-                       "Reduce if training on shorter audio clips."
-                   ))
+    # Experiment identity
+    p.add_argument("--task",              type=str, default="asr",           choices=SUPPORTED_TASKS)
+    p.add_argument("--benchmark_dataset", type=str, default="librispeech",   choices=list(BENCHMARK_REGISTRY.keys()))
+    p.add_argument("--tokens_per_frame",  type=int, default=1)
+    p.add_argument("--total_frames",      type=int, default=1500)
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    p.add_argument("--model_size", type=str, default="small",
-                   choices=list(WHISPER_SIZES.keys()),
-                   help="Whisper model size")
-    p.add_argument("--mode", type=str, default="lora",
-                   choices=["full", "lora"],
-                   help="Finetuning mode: full weights or LoRA adapters")
+    # Model
+    p.add_argument("--model_size", type=str, default="small", choices=list(WHISPER_SIZES.keys()))
+    p.add_argument("--mode",       type=str, default="lora",  choices=["full", "lora"])
 
-    # ── Data ──────────────────────────────────────────────────────────────────
-    p.add_argument("--train_split", type=str, default=None,
-                   help="Override training split (defaults to benchmark registry value)")
-    p.add_argument("--eval_split", type=str, default=None,
-                   help="Override eval split (defaults to benchmark registry value)")
-    p.add_argument("--max_label_len", type=int, default=448,
-                   help="Hard cap on label token length (further bounded by total_frames*tokens_per_frame)")
-    p.add_argument("--num_proc", type=int, default=4,
-                   help="Workers for dataset preprocessing")
+    # Data
+    p.add_argument("--train_split",       type=str,  default=None)
+    p.add_argument("--eval_split",        type=str,  default=None)
+    p.add_argument("--max_label_len",     type=int,  default=448)
+    p.add_argument("--num_proc",          type=int,  default=1)
+    p.add_argument("--streaming",         action="store_true",
+                   help="Stream dataset on the fly — zero disk cache")
+    p.add_argument("--max_train_samples", type=int,  default=None,
+                   help="Cap training set size (e.g. 2000 for quick runs)")
+    p.add_argument("--max_eval_samples",  type=int,  default=None,
+                   help="Cap eval/test set size")
 
-    # ── LoRA ──────────────────────────────────────────────────────────────────
+    # LoRA
     p.add_argument("--lora_r",       type=int,   default=32)
     p.add_argument("--lora_alpha",   type=int,   default=64)
     p.add_argument("--lora_dropout", type=float, default=0.05)
 
-    # ── Training ──────────────────────────────────────────────────────────────
+    # Training
     p.add_argument("--batch_size",      type=int,   default=16)
     p.add_argument("--eval_batch_size", type=int,   default=8)
     p.add_argument("--grad_accum",      type=int,   default=2)
     p.add_argument("--learning_rate",   type=float, default=1e-5)
     p.add_argument("--warmup_steps",    type=int,   default=500)
-    p.add_argument("--max_steps",       type=int,   default=4000,
-                   help="Total training steps. -1 to use num_epochs instead.")
+    p.add_argument("--max_steps",       type=int,   default=4000)
     p.add_argument("--num_epochs",      type=int,   default=3)
     p.add_argument("--eval_steps",      type=int,   default=500)
     p.add_argument("--log_steps",       type=int,   default=25)
     p.add_argument("--fp16",            action="store_true", default=True)
 
-    # ── Output ────────────────────────────────────────────────────────────────
+    # Output
     p.add_argument("--output_dir", type=str, default="./checkpoints")
 
-    # ── Eval only ─────────────────────────────────────────────────────────────
-    p.add_argument("--eval_only",  action="store_true",
-                   help="Skip training, run evaluation from checkpoint")
-    p.add_argument("--checkpoint", type=str, default=None,
-                   help="Checkpoint path for eval_only mode")
+    # Eval only
+    p.add_argument("--eval_only",  action="store_true")
+    p.add_argument("--checkpoint", type=str, default=None)
 
-    # ── Sweep ─────────────────────────────────────────────────────────────────
+    # Sweep
     p.add_argument("--sweep",       action="store_true")
     p.add_argument("--sweep_sizes", type=str, default="small,medium,large-v3")
     p.add_argument("--sweep_modes", type=str, default="full,lora")
@@ -826,8 +867,7 @@ def parse_args(argv=None):
 
 
 if __name__ == "__main__":
-    args = parse_args()   # parses sys.argv by default
-
+    args = parse_args()
     if args.sweep:
         run_sweep(args)
     elif args.eval_only:
