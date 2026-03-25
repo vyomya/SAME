@@ -3,5 +3,5 @@
 
 ### Run Command
 ```
-python run.py --task asr --benchmark_dataset librispeech --llm_size small --tokens_per_frame 16 --total_frames 160
+python run.py --task asr --benchmark_dataset librispeech --llm_size small --tokens_per_frame 16 --total_frames 160 --streaming
 ```
