@@ -398,7 +398,7 @@ def build_model_full(model_name: str) -> WhisperForConditionalGeneration:
     print(f"Loading {model_name} (full finetune)...")
     model = WhisperForConditionalGeneration.from_pretrained(model_name)
     model.config.forced_decoder_ids = None
-    model.config.suppress_tokens    = []
+    model.generation_config.suppress_tokens = []
     model.config.use_cache          = False   # required for gradient checkpointing
     total = sum(p.numel() for p in model.parameters())
     print(f"  Total params: {total:,} | All trainable")
@@ -419,7 +419,7 @@ def build_model_lora(
     print(f"Loading {model_name} (LoRA r={lora_r}, alpha={lora_alpha})...")
     model = WhisperForConditionalGeneration.from_pretrained(model_name)
     model.config.forced_decoder_ids = None
-    model.config.suppress_tokens    = []
+    model.generation_config.suppress_tokens = []
     model.config.use_cache          = False
 
     lora_cfg = LoraConfig(
