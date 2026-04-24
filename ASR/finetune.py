@@ -26,26 +26,34 @@ Usage (called from run_experiment.py):
 # CACHE SETUP — must be before ALL other imports
 # ─────────────────────────────────────────────────────────────────────────────
 import os
-CACHE_DIR = "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache"
-os.environ["LD_LIBRARY_PATH"] = (
-    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib:"
-    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/torch/lib:"
-    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:"
-    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:"
-    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/npp/lib:"
-    + os.environ.get("LD_LIBRARY_PATH", "")
-)
+
+BASE = "/scratch/zt1/project/msml604/user/mokshdag/miniconda3/envs/same"
+_lib_paths = [
+    f"{BASE}/lib/python3.11/site-packages/nvidia/nccl/lib",
+    f"{BASE}/lib",
+    f"{BASE}/lib/python3.11/site-packages/torch/lib",
+    f"{BASE}/lib/python3.11/site-packages/nvidia/cuda_runtime/lib",
+    f"{BASE}/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib",
+    f"{BASE}/lib/python3.11/site-packages/nvidia/npp/lib",
+]
+existing = os.environ.get("LD_LIBRARY_PATH", "")
+os.environ["LD_LIBRARY_PATH"] = ":".join(_lib_paths) + (":" + existing if existing else "")
+
+CACHE_DIR = "/scratch/zt1/project/msml604/user/mokshdag/hf_cache"
+VYOM_CACHE = "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache"
+
 local_path = {
-    "small":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d",
-    "medium": "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-medium/snapshots/abdf7c39ab9d0397620ccaea8974cc764cd0953e", 
-    "tiny":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af", 
-    "large-v3":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1"
+    "small": f"{VYOM_CACHE}/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d",
+    "medium": f"{VYOM_CACHE}/models/models--openai--whisper-medium/snapshots/abdf7c39ab9d0397620ccaea8974cc764cd0953e",
+    "tiny": f"{VYOM_CACHE}/models/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af",
+    "large-v3": f"{VYOM_CACHE}/models/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1"
 }
-os.environ["HF_HOME"]               = CACHE_DIR
-os.environ["HF_DATASETS_CACHE"]     = f"{CACHE_DIR}/datasets"
-os.environ["TRANSFORMERS_CACHE"]    = f"{CACHE_DIR}/models"
-os.environ["HUGGINGFACE_HUB_CACHE"] = f"{CACHE_DIR}/hub"
-os.environ["DATASETS_AUDIO_BACKEND"]    = "soundfile"
+
+os.environ["HF_HOME"]                = CACHE_DIR
+os.environ["HF_DATASETS_CACHE"]      = f"{VYOM_CACHE}/datasets"
+os.environ["TRANSFORMERS_CACHE"]     = f"{VYOM_CACHE}/models"
+os.environ["HUGGINGFACE_HUB_CACHE"]  = f"{VYOM_CACHE}/hub"
+os.environ["DATASETS_AUDIO_BACKEND"] = "soundfile"
 # ─────────────────────────────────────────────────────────────────────────────
 # IMPORTS
 # ─────────────────────────────────────────────────────────────────────────────
