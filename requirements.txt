@@ -5,7 +5,7 @@ aiosignal==1.4.0
 annotated-doc==0.0.4
 anyio==4.12.1
 attrs==25.4.0
-certifi @ file:///home/conda/feedstock_root/build_artifacts/certifi_1772001073725/work/certifi
+certifi
 charset-normalizer==3.4.4
 click==8.3.1
 cuda-bindings==13.2.0
@@ -75,7 +75,7 @@ nvidia-nvshmem-cu13==3.4.5
 nvidia-nvtx==13.0.85
 nvidia-nvtx-cu11==11.8.86
 nvidia-nvtx-cu12==12.8.90
-packaging @ file:///home/task_176104885106445/conda-bld/packaging_1761049078006/work
+packaging
 pandas==3.0.1
 peft==0.18.1
 pillow==12.1.1
