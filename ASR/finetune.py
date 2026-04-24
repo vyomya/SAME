@@ -35,7 +35,12 @@ os.environ["LD_LIBRARY_PATH"] = (
     "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/npp/lib:"
     + os.environ.get("LD_LIBRARY_PATH", "")
 )
-local_path = "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d"
+local_path = {
+    "small":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d",
+    "medium": "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-medium/snapshots/abdf7c39ab9d0397620ccaea8974cc764cd0953e", 
+    "tiny":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af", 
+    "large-v3":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1"
+}
 os.environ["HF_HOME"]               = CACHE_DIR
 os.environ["HF_DATASETS_CACHE"]     = f"{CACHE_DIR}/datasets"
 os.environ["TRANSFORMERS_CACHE"]    = f"{CACHE_DIR}/models"
@@ -464,8 +469,8 @@ def train(args):
     max_train_samples = getattr(args, "max_train_samples",  None)
     max_eval_samples  = getattr(args, "max_eval_samples",   None)
 
-    model_name = local_path
-    run_name   = f"whisper-{args.model_size}-{args.mode}-{benchmark}-{task}"
+    model_name = local_path[args.model_size]
+    run_name   = f"whisper-{args.model_size}-{args.mode}-{benchmark}-{task}-{tokens_per_frame}-{total_frames}-a100"
     output_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -858,7 +863,7 @@ def parse_args(argv=None):
     p.add_argument("--fp16",            action="store_true", default=True)
 
     # Output
-    p.add_argument("--output_dir", type=str, default="./checkpoints")
+    p.add_argument("--output_dir", type=str, default="./scratch/zt1/project/msml604/user/vyomwal5/checkpoints")
 
     # Eval only
     p.add_argument("--eval_only",  action="store_true")
