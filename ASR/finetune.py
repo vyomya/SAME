@@ -26,12 +26,21 @@ Usage (called from run_experiment.py):
 # CACHE SETUP — must be before ALL other imports
 # ─────────────────────────────────────────────────────────────────────────────
 import os
-CACHE_DIR = "/fs/nexus-scratch/vyomwal5/anaconda3/envs/asr/hf_cache"
+CACHE_DIR = "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache"
+os.environ["LD_LIBRARY_PATH"] = (
+    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib:"
+    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/torch/lib:"
+    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:"
+    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:"
+    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/npp/lib:"
+    + os.environ.get("LD_LIBRARY_PATH", "")
+)
+local_path = "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d"
 os.environ["HF_HOME"]               = CACHE_DIR
 os.environ["HF_DATASETS_CACHE"]     = f"{CACHE_DIR}/datasets"
 os.environ["TRANSFORMERS_CACHE"]    = f"{CACHE_DIR}/models"
 os.environ["HUGGINGFACE_HUB_CACHE"] = f"{CACHE_DIR}/hub"
-
+os.environ["DATASETS_AUDIO_BACKEND"]    = "soundfile"
 # ─────────────────────────────────────────────────────────────────────────────
 # IMPORTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,7 +55,7 @@ import evaluate
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, List, Optional, Union
-
+from jiwer import wer as jiwer_wer
 from datasets import (
     load_dataset,
     Audio,
@@ -364,7 +373,6 @@ class WhisperDataCollator:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_compute_metrics(processor):
-    wer_metric = evaluate.load("wer")
 
     def normalize(text: str) -> str:
         text = text.lower().strip()
@@ -382,8 +390,7 @@ def make_compute_metrics(processor):
 
         pred_str  = [normalize(p) for p in pred_str]
         label_str = [normalize(r) for r in label_str]
-
-        wer = wer_metric.compute(predictions=pred_str, references=label_str)
+        wer = jiwer_wer(label_str, pred_str)
         return {"wer": round(100 * wer, 4)}
 
     return compute_metrics
@@ -396,7 +403,7 @@ def make_compute_metrics(processor):
 def build_model_full(model_name: str) -> WhisperForConditionalGeneration:
     """All weights trainable."""
     print(f"Loading {model_name} (full finetune)...")
-    model = WhisperForConditionalGeneration.from_pretrained(model_name)
+    model = WhisperForConditionalGeneration.from_pretrained("model_name")
     model.config.forced_decoder_ids = None
     model.generation_config.suppress_tokens = []
     model.config.use_cache          = False   # required for gradient checkpointing
@@ -457,7 +464,7 @@ def train(args):
     max_train_samples = getattr(args, "max_train_samples",  None)
     max_eval_samples  = getattr(args, "max_eval_samples",   None)
 
-    model_name = WHISPER_SIZES[args.model_size]
+    model_name = local_path
     run_name   = f"whisper-{args.model_size}-{args.mode}-{benchmark}-{task}"
     output_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(output_dir, exist_ok=True)
@@ -694,7 +701,6 @@ def evaluate_checkpoint(args):
                 max_samples=getattr(args, "max_eval_samples", None),
             )
 
-    wer_metric = evaluate.load("wer")
     results    = {}
 
     for split_name, dataset in eval_splits.items():
@@ -729,7 +735,7 @@ def evaluate_checkpoint(args):
             total_audio_s += audio_dur_s
             total_infer_s += infer_time
 
-        wer = wer_metric.compute(predictions=all_preds, references=all_refs)
+        wer = jiwer_wer(all_refs, all_preds)
         rtf = total_infer_s / total_audio_s
         results[split_name] = {
             "wer":           round(100 * wer, 3),
