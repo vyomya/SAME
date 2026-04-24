@@ -863,7 +863,7 @@ def parse_args(argv=None):
     p.add_argument("--fp16",            action="store_true", default=True)
 
     # Output
-    p.add_argument("--output_dir", type=str, default="./scratch/zt1/project/msml604/user/vyomwal5/checkpoints")
+    p.add_argument("--output_dir", type=str, default="/scratch/zt1/project/msml604/user/vyomwal5/checkpoints")
 
     # Eval only
     p.add_argument("--eval_only",  action="store_true")
