@@ -243,49 +243,55 @@ def prepare_dataset(
     sampling_rate:    int = 16_000,
 ):
     """
-    Converts a single sample's raw audio + transcript into model inputs.
+    Converts raw audio + transcript into model inputs.
 
-    Works for both streaming (IterableDataset) and non-streaming (Dataset).
-    For streaming, audio resampling is done here since cast_column is not
-    available on IterableDataset at load time.
+    Axis mapping to the paper:
+      xN → model_size  (handled at model build time)
+      xT → total_frames (truncates audio here — fewer encoder frames)
+      xV → tokens_per_frame (NOT applied here — applied in model.forward()
+                              by subsampling encoder hidden states before decoder)
 
-    Whisper STFT (built into WhisperFeatureExtractor):
-      n_fft=400 (25ms @ 16kHz), hop=160 (10ms), n_mels=128
-      → 2× CNN stride → 1500 encoder frames for 30s audio
+    Always produces input_features of shape (128, 3000) so Whisper's
+    Conv1d layers and positional embeddings receive a valid fixed-size input.
     """
-    audio = batch["audio"]
-    audio_array = audio["array"]
+    audio       = batch["audio"]
+    audio_array = np.array(audio["array"], dtype=np.float32)
     audio_sr    = audio["sampling_rate"]
 
-    # Resample if needed (important for streaming where cast_column wasn't called)
+    # ── Resample if needed (critical for streaming where cast_column wasn't called)
     if audio_sr != sampling_rate:
-        
-        waveform = torch.tensor(audio_array).unsqueeze(0)
-        resampler = torchaudio.transforms.Resample(audio_sr, sampling_rate)
-        audio_array = resampler(waveform).squeeze(0).numpy()
+        waveform    = torch.tensor(audio_array).unsqueeze(0)
+        resampler   = torchaudio.transforms.Resample(audio_sr, sampling_rate)
+        audio_array = resampler(waveform).squeeze(0).numpy().astype(np.float32)
 
-    # Log-mel spectrogram: (128, 3000)
+    # ── xT axis: truncate audio to control duration ───────────────────────────
+    # total_frames=1500 → 30s (full Whisper window)
+    # total_frames=750  → 15s
+    # total_frames=375  → 7.5s
+    max_audio_samples = int((total_frames / 1500) * 30 * sampling_rate)
+    audio_array = audio_array[:max_audio_samples]
+
+    # ── Feature extraction — always outputs (128, 3000) ───────────────────────
+    # WhisperFeatureExtractor pads short arrays to fill the full window,
+    # so truncated audio still produces a valid (128, 3000) tensor.
+    # xV subsampling is NOT done here — it happens inside model.forward().
     batch["input_features"] = processor.feature_extractor(
-        audio_array.astype(np.float32),
+        audio_array,
         sampling_rate=sampling_rate,
-    ).input_features[0]
+    ).input_features[0]   # shape: (128, 3000) always
 
-    # Derive label budget from audio framing
-    effective_max = min(max_label_len, total_frames * tokens_per_frame)
-
-    # Tokenize transcript
+    # ── Label tokenization ────────────────────────────────────────────────────
     transcript = batch[text_column]
     if isinstance(transcript, str):
         transcript = transcript.lower()
 
     batch["labels"] = processor.tokenizer(
         transcript,
-        max_length=effective_max,
+        max_length=max_label_len,
         truncation=True,
     ).input_ids
 
-    return batch
-
+    return batch 
 
 def apply_preprocessing(
     dataset:          Union[Dataset, IterableDataset],
@@ -408,7 +414,7 @@ def make_compute_metrics(processor):
 def build_model_full(model_name: str) -> WhisperForConditionalGeneration:
     """All weights trainable."""
     print(f"Loading {model_name} (full finetune)...")
-    model = WhisperForConditionalGeneration.from_pretrained("model_name")
+    model = WhisperForConditionalGeneration.from_pretrained(model_name)
     model.config.forced_decoder_ids = None
     model.generation_config.suppress_tokens = []
     model.config.use_cache          = False   # required for gradient checkpointing
@@ -863,7 +869,7 @@ def parse_args(argv=None):
     p.add_argument("--fp16",            action="store_true", default=True)
 
     # Output
-    p.add_argument("--output_dir", type=str, default="/scratch/zt1/project/msml604/user/vyomwal5/checkpoints")
+    p.add_argument("--output_dir", type=str, default="/home/vyomwal5/SAME/checkpoints")
 
     # Eval only
     p.add_argument("--eval_only",  action="store_true")
