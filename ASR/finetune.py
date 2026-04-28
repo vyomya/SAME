@@ -328,6 +328,7 @@ def apply_preprocessing(
             map_fn,
             remove_columns=["file", "audio", text_column,
                              "speaker_id", "chapter_id", "id"],
+            load_from_cache_file=False,
         )
     else:
         # Cached: parallel map with num_proc
@@ -336,6 +337,7 @@ def apply_preprocessing(
             remove_columns=dataset.column_names,
             num_proc=num_proc,
             desc="Preprocessing",
+            load_from_cache_file=False,
         )
 
     return dataset
