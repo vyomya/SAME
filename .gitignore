@@ -1,0 +1,4 @@
+checkpoints/
+old_checkpoints/
+*.log
+ASR/__pycache__/
