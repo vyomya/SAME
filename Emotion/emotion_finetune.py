@@ -1,33 +1,3 @@
-"""
-Emotion Recognition Finetuning
-===============================
-Two modes:
-  mode=full  — finetune entire wav2vec2/HuBERT encoder + classifier head, all weights
-  mode=lora  — LoRA on self-attention q_proj/v_proj, frozen base, only head + adapters
-
-Key design: LAZY LOADING
-  Audio is read from disk on-the-fly in the DataLoader workers.
-  No preprocessing map() step — avoids OOM when loading 7500 wav files into RAM.
-
-Model choices (set via --model_name):
-  facebook/wav2vec2-large-robust          <- default, best general SER
-  facebook/hubert-large-ls960-ft          <- strong alternative
-  facebook/wav2vec2-base                  <- fast/cheap baseline
-  microsoft/wavlm-large                   <- best on SUPERB benchmark
-
-Usage (standalone):
-  python emotion_finetune.py --model_name facebook/wav2vec2-large-robust --mode lora
-  python emotion_finetune.py --model_name facebook/wav2vec2-base --mode lora --max_train_samples 2000
-
-Usage (called from run_emotion_experiment.py):
-  python run_emotion_experiment.py --benchmark_dataset cremad \
-      --llm_name facebook/wav2vec2-large-robust \
-      -- --mode lora --lora_r 32 --batch_size 8
-"""
-
-# -----------------------------------------------------------------------------
-# CACHE SETUP - must be before ALL other imports
-# -----------------------------------------------------------------------------
 import os
 
 BASE = "/scratch/zt1/project/msml604/user/mokshdag/miniconda3/envs/same"
@@ -136,16 +106,7 @@ LORA_TARGET_MODULES = ["q_proj", "v_proj", "k_proj", "out_proj"]
 # -----------------------------------------------------------------------------
 
 class CremaDataset(torch.utils.data.Dataset):
-    """
-    Lazy-loading PyTorch Dataset for CREMA-D wav files.
 
-    Audio is read from disk only when __getitem__ is called (inside DataLoader
-    workers), so the full dataset never sits in RAM simultaneously.
-    This is the key fix for the OOM crash at 67% preprocessing.
-
-    Label extracted from filename: 1001_DFA_ANG_XX.wav -> parts[2] = ANG
-    Split: 80% train / 10% validation / 10% test (deterministic, seed=42)
-    """
 
     def __init__(
         self,
@@ -229,11 +190,6 @@ class CremaDataset(torch.utils.data.Dataset):
             item["attention_mask"] = inputs.attention_mask[0]
         return item
 
-
-# -----------------------------------------------------------------------------
-# DATA COLLATOR
-# -----------------------------------------------------------------------------
-
 @dataclass
 class EmotionDataCollator:
     """
@@ -255,10 +211,6 @@ class EmotionDataCollator:
             )
         return batch
 
-
-# -----------------------------------------------------------------------------
-# METRICS
-# -----------------------------------------------------------------------------
 
 def make_compute_metrics(label_names: List[str]):
     def compute_metrics(eval_pred):
@@ -298,19 +250,7 @@ def build_model_full(model_name, num_labels, label_names):
 def build_model_lora(model_name, num_labels, label_names,
                      lora_r=16, lora_alpha=32, lora_dropout=0.05,
                      unfreeze_top_layers=4):
-    # LoRA + unfreeze top N transformer layers of the encoder.
-    #
-    # Why unfreeze top layers:
-    #   wav2vec2-large-robust has 24 transformer layers. LoRA alone on
-    #   attention projections is insufficient for SER because the feed-forward
-    #   layers carry most representational capacity but are not touched by LoRA.
-    #   Unfreezing top 4 layers gives enough capacity to adapt to emotion
-    #   while keeping 80%+ of the encoder frozen.
-    #
-    # unfreeze_top_layers:
-    #   0  = LoRA only (~1% trainable) -- too little for SER
-    #   4  = LoRA + top 4 layers (~16% trainable) -- recommended
-    #   8  = LoRA + top 8 layers (~30% trainable) -- if 4 underperforms
+    
     print(f"Loading {model_name} (LoRA r={lora_r}, alpha={lora_alpha}, "
           f"unfreeze_top={unfreeze_top_layers}, {num_labels} classes)...")
     model = AutoModelForAudioClassification.from_pretrained(
@@ -321,12 +261,9 @@ def build_model_lora(model_name, num_labels, label_names,
         ignore_mismatched_sizes=True,
     )
 
-    # Step 1: freeze everything
     for param in model.parameters():
         param.requires_grad = False
 
-    # Step 2: apply LoRA to attention projections across ALL layers
-    # (must happen BEFORE manual unfreezing — get_peft_model resets requires_grad)
     try:
         task_type = TaskType.AUDIO_CLASSIFICATION
     except AttributeError:
@@ -342,9 +279,6 @@ def build_model_lora(model_name, num_labels, label_names,
     )
     model = get_peft_model(model, lora_cfg)
 
-    # Step 3: unfreeze top N encoder transformer layers AFTER LoRA wrapping
-    # get_peft_model() resets requires_grad, so unfreezing must come after.
-    # Access via base_model.model to get through the PeftModel wrapper.
     encoder_layers = model.base_model.model.wav2vec2.encoder.layers
     total_layers   = len(encoder_layers)
     unfreeze_from  = max(0, total_layers - unfreeze_top_layers)
@@ -363,9 +297,6 @@ def build_model_lora(model_name, num_labels, label_names,
     return model
 
 
-# -----------------------------------------------------------------------------
-# TRAINING
-# -----------------------------------------------------------------------------
 
 def train(args):
     benchmark   = getattr(args, "benchmark_dataset", "cremad")
@@ -464,20 +395,9 @@ def train(args):
         remove_unused_columns=False,
     )
 
-    # ── Two-stage optimizer with proper warmup scheduler ────────────────────
-    # Problem with previous approach: passing (optimizer, None) to Trainer
-    # means NO scheduler — causing grad_norm spikes (146+) seen in training.
-    # Fix: build the optimizer + linear warmup scheduler manually and pass both.
-    #
-    # Head (classifier + projector): randomly initialized → lr=1e-3
-    # LoRA adapters: pretrained features → lr=args.learning_rate (1e-4)
-    # Full finetune: single lr, let Trainer handle everything normally.
 
     if args.mode == "lora":
-        # Three param groups:
-        #   head       (classifier + projector) : lr=1e-3  randomly initialized
-        #   encoder    (unfrozen top layers)     : lr=5e-5  pretrained, adapt gently
-        #   lora       (LoRA adapters)           : lr=args.learning_rate
+        
         head_params    = [(n, p) for n, p in model.named_parameters()
                           if ("classifier" in n or "projector" in n) and p.requires_grad]
         encoder_params = [(n, p) for n, p in model.named_parameters()
@@ -508,7 +428,6 @@ def train(args):
         )
         optimizers = (optimizer, scheduler)
     else:
-        # Full finetune: let Trainer build optimizer + scheduler normally
         optimizers = (None, None)
 
     trainer = Trainer(
@@ -562,10 +481,6 @@ def train(args):
 
     return output_dir
 
-
-# -----------------------------------------------------------------------------
-# EVALUATION
-# -----------------------------------------------------------------------------
 
 def evaluate_checkpoint(args):
     checkpoint_dir = args.checkpoint
@@ -668,10 +583,6 @@ def evaluate_checkpoint(args):
     return summary
 
 
-# -----------------------------------------------------------------------------
-# SWEEP
-# -----------------------------------------------------------------------------
-
 def run_sweep(args):
     models = args.sweep_models.split(",")
     modes  = args.sweep_modes.split(",")
@@ -706,10 +617,6 @@ def run_sweep(args):
     for r in all_results:
         print(f"  {r['model_name']:40s} | {r['mode']:5s} | UA={r.get('ua','N/A')}%")
 
-
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(

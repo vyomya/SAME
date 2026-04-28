@@ -1,65 +1,4 @@
-"""
-run_emotion_experiment.py — Experiment launcher for Speech Emotion Recognition
-===============================================================================
 
-This script owns the high-level experiment axes:
-  --benchmark_dataset   benchmark to train/eval on (iemocap | cremad | ravdess | msp_improv)
-  --llm_name            encoder model name or shorthand key (e.g. wav2vec2-large-robust)
-  --max_audio_len       max clip length in seconds (overrides per-benchmark default)
-
-Everything else is passed through as raw vargs after `--` and forwarded
-directly to emotion_finetune.py's argument parser.
-
-Design rationale
-----------------
-Same separation-of-concerns as run_experiment.py:
-  - run_emotion_experiment.py  → what experiment (axes, dataset, model choice)
-  - emotion_finetune.py        → how to run it (training loop, LoRA, eval)
-  - vargs let you override ANY emotion_finetune arg without touching this file
-
-Model shorthands (--llm_name):
-  wav2vec2-large-robust   → facebook/wav2vec2-large-robust   [default, best SER]
-  hubert-large            → facebook/hubert-large-ls960-ft
-  wav2vec2-base           → facebook/wav2vec2-base
-  wavlm-large             → microsoft/wavlm-large            [best SUPERB]
-  wav2vec2-large          → facebook/wav2vec2-large-960h
-
-  You can also pass a full HuggingFace path directly (e.g. superb/wav2vec2-large-superb-er).
-
-Usage
------
-  # Basic: LoRA on IEMOCAP with wav2vec2-large-robust
-  python run_emotion_experiment.py \\
-      --benchmark_dataset iemocap \\
-      --llm_name wav2vec2-large-robust
-
-  # Full finetune on CREMA-D with WavLM-large
-  python run_emotion_experiment.py \\
-      --benchmark_dataset cremad \\
-      --llm_name wavlm-large \\
-      -- --mode full --batch_size 8 --max_steps 2000
-
-  # Eval only from a saved checkpoint
-  python run_emotion_experiment.py \\
-      --benchmark_dataset iemocap \\
-      --llm_name wav2vec2-large-robust \\
-      -- --eval_only --checkpoint ./checkpoints/ser-wav2vec2-large-robust-lora-iemocap-r32
-
-  # Sweep over all models × modes
-  python run_emotion_experiment.py \\
-      --benchmark_dataset iemocap \\
-      --llm_name wav2vec2-large-robust \\
-      -- --sweep \\
-         --sweep_models facebook/wav2vec2-large-robust,microsoft/wavlm-large \\
-         --sweep_modes full,lora
-
-  # Quick smoke test (2000 samples, streaming)
-  python run_emotion_experiment.py \\
-      --benchmark_dataset cremad \\
-      --llm_name wav2vec2-base \\
-      -- --streaming --max_train_samples 2000 --max_eval_samples 500 \\
-         --mode lora --max_steps 300
-"""
 
 import sys
 import argparse
@@ -68,17 +7,9 @@ import argparse
 import Emotion.emotion_finetune as ef
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# VALID VALUES
-# ─────────────────────────────────────────────────────────────────────────────
-
 VALID_BENCHMARKS = list(ef.BENCHMARK_REGISTRY.keys())
 MODEL_SHORTHANDS = ef.MODEL_REGISTRY   # key → full HF path
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ARGUMENT PARSER
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_launcher_args():
     p = argparse.ArgumentParser(
@@ -140,10 +71,6 @@ def parse_launcher_args():
     return launcher_args, vargs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
 def resolve_model_name(llm_name: str) -> str:
     """
     Resolve a shorthand key to a full HF model path.
@@ -169,10 +96,6 @@ def build_finetune_argv(launcher_args, vargs: list) -> list:
     vargs_clean = [a for a in vargs if a != "--"]
     return base + vargs_clean
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     launcher_args, vargs = parse_launcher_args()
