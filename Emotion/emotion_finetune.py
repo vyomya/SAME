@@ -388,8 +388,9 @@ def train(args):
         greater_is_better=True,
 
         logging_steps=args.log_steps,
-        report_to=[],
+        report_to=["tensorboard"],
         run_name=run_name,
+        logging_dir=f"/scratch/zt1/project/msml604/user/mokshdag/tensorboard_logs/{run_name}",
 
         dataloader_num_workers=1,
         remove_unused_columns=False,
