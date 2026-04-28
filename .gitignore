@@ -2,3 +2,4 @@ checkpoints/
 old_checkpoints/
 *.log
 ASR/__pycache__/
+*.pyc
