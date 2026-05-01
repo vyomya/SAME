@@ -36,7 +36,7 @@ os.environ["LD_LIBRARY_PATH"] = (
     + os.environ.get("LD_LIBRARY_PATH", "")
 )
 local_path = {
-    "small":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d",
+    "small":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d",
     "medium": "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-medium/snapshots/abdf7c39ab9d0397620ccaea8974cc764cd0953e", 
     "tiny":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af", 
     "large-v3":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1"
@@ -335,7 +335,8 @@ def apply_preprocessing(
         dataset = dataset.map(
             map_fn,
             remove_columns=dataset.column_names,
-            num_proc=num_proc,
+            num_proc=1,
+            writer_batch_size=50, # for Large models
             desc="Preprocessing",
             load_from_cache_file=False,
         )
@@ -356,6 +357,7 @@ class WhisperDataCollator:
     time the collator sees data, it's already been preprocessed into tensors.
     """
     processor: Any
+    fp16: bool = False
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         # Audio features — already (128, 3000), just stack
@@ -364,6 +366,8 @@ class WhisperDataCollator:
             input_features, return_tensors="pt"
         )
 
+        if self.fp16:
+            batch["input_features"] = batch["input_features"].half()
         # Labels — pad with -100
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.processor.tokenizer.pad(
@@ -413,10 +417,11 @@ def make_compute_metrics(processor):
 # MODEL SETUP
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_model_full(model_name: str) -> WhisperForConditionalGeneration:
+def build_model_full(model_name: str,fp16 = False) -> WhisperForConditionalGeneration:
     """All weights trainable."""
+    dtype = torch.float16 if fp16 else torch.float32
     print(f"Loading {model_name} (full finetune)...")
-    model = WhisperForConditionalGeneration.from_pretrained(model_name)
+    model = WhisperForConditionalGeneration.from_pretrained(model_name,torch_dtype=dtype)
     model.config.forced_decoder_ids = None
     model.generation_config.suppress_tokens = []
     model.config.use_cache          = False   # required for gradient checkpointing
@@ -430,14 +435,16 @@ def build_model_lora(
     lora_r:       int   = 32,
     lora_alpha:   int   = 64,
     lora_dropout: float = 0.05,
+    fp16:         bool  = False
 ) -> WhisperForConditionalGeneration:
     """
     LoRA on q_proj + v_proj across:
       encoder self-attn, decoder self-attn, decoder cross-attn (encoder_attn).
     Reduces trainable params to ~1% while preserving general speech knowledge.
     """
+    dtype = torch.float16 if fp16 else torch.float32
     print(f"Loading {model_name} (LoRA r={lora_r}, alpha={lora_alpha})...")
-    model = WhisperForConditionalGeneration.from_pretrained(model_name)
+    model = WhisperForConditionalGeneration.from_pretrained(model_name,torch_dtype=dtype,)
     model.config.forced_decoder_ids = None
     model.generation_config.suppress_tokens = []
     model.config.use_cache          = False
@@ -478,7 +485,7 @@ def train(args):
     max_eval_samples  = getattr(args, "max_eval_samples",   None)
 
     model_name = local_path[args.model_size]
-    run_name   = f"whisper-{args.model_size}-{args.mode}-{benchmark}-{task}-{tokens_per_frame}-{total_frames}-a100"
+    run_name   = f"whisper-{args.model_size}-{args.mode}-{benchmark}-{task}-{tokens_per_frame}-{total_frames}-v100"
     output_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -527,18 +534,19 @@ def train(args):
 
     # ── Model ─────────────────────────────────────────────────────────────────
     if args.mode == "full":
-        model = build_model_full(model_name)
+        model = build_model_full(model_name,fp16=args.fp16)
     elif args.mode == "lora":
         model = build_model_lora(
             model_name,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
+            fp16=args.fp16
         )
     else:
         raise ValueError(f"Unknown mode '{args.mode}'. Choose 'full' or 'lora'.")
 
-    collator = WhisperDataCollator(processor=processor)
+    collator = WhisperDataCollator(processor=processor,fp16=args.fp16)
 
     # ── Training arguments ────────────────────────────────────────────────────
     #
@@ -665,7 +673,7 @@ def evaluate_checkpoint(args):
     assert checkpoint_dir, "--checkpoint required for eval_only mode"
 
     device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_name = WHISPER_SIZES[args.model_size]
+    model_name = local_path[args.model_size]
     benchmark  = getattr(args, "benchmark_dataset", "librispeech")
     bench_info = BENCHMARK_REGISTRY.get(benchmark, BENCHMARK_REGISTRY["librispeech"])
     text_column = bench_info["text_column"]
@@ -682,12 +690,20 @@ def evaluate_checkpoint(args):
 
     # ── Load model ────────────────────────────────────────────────────────────
     if args.mode == "lora":
-        base = WhisperForConditionalGeneration.from_pretrained(model_name)
+        dtype = torch.float16 if getattr(args, "fp16", True) else torch.float32
+        base = WhisperForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=dtype,             # ← was missing here
+        )
         base.config.forced_decoder_ids = None
         model = PeftModel.from_pretrained(base, checkpoint_dir)
         model = model.merge_and_unload()
     else:
-        model = WhisperForConditionalGeneration.from_pretrained(checkpoint_dir)
+        dtype = torch.float16 if getattr(args, "fp16", True) else torch.float32
+        model = WhisperForConditionalGeneration.from_pretrained(
+            checkpoint_dir,
+            torch_dtype=dtype,             # ← was missing here too
+        )
 
     model.config.forced_decoder_ids = None
     model = model.to(device).eval()
@@ -726,11 +742,12 @@ def evaluate_checkpoint(args):
             audio_array = sample["audio"]["array"].astype(np.float32)
             ref_text    = sample[text_column].lower().strip()
             audio_dur_s = len(audio_array) / 16_000
-
+            fp16 = getattr(args, "fp16", True) 
             features = processor.feature_extractor(
                 audio_array, sampling_rate=16_000, return_tensors="pt"
             ).input_features.to(device)
-
+            if fp16:
+                features = features.half() 
             t0 = time.time()
             with torch.no_grad():
                 pred_ids = model.generate(
@@ -791,6 +808,11 @@ def run_sweep(args):
             args.mode       = mode
 
             checkpoint_dir = train(args)
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
             eval_summary   = evaluate_checkpoint(
                 argparse.Namespace(
                     model_size=size,
@@ -800,7 +822,9 @@ def run_sweep(args):
                     max_eval_samples=getattr(args, "max_eval_samples", None),
                 )
             )
-
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             meta_path = os.path.join(checkpoint_dir, "run_meta.json")
             with open(meta_path) as f:
                 meta = json.load(f)
