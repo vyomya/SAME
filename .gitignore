@@ -1,5 +1,9 @@
 checkpoints/
 old_checkpoints/
+eval_results/
+eval_results_a100/
+eval_results_v100/
+evaluated_checkpoints/
 *.log
 ASR/__pycache__/
 *.pyc
