@@ -23,6 +23,7 @@ os.environ["DATASETS_AUDIO_BACKEND"] = "soundfile"
 # Local paths
 LOCAL_MODEL_PATH = {
     "facebook/wav2vec2-large-robust": f"{CACHE_DIR}/models/wav2vec2-large-robust",
+    "facebook/wav2vec2-base":         f"{CACHE_DIR}/models/wav2vec2-base",
 }
 
 CREMAD_AUDIO_DIR = f"{CACHE_DIR}/datasets/crema-d/data/data/AudioWAV"
@@ -312,11 +313,12 @@ def train(args):
     max_train_samples = getattr(args, "max_train_samples", None)
     max_eval_samples  = getattr(args, "max_eval_samples",  None)
 
-    model_slug = model_name.replace("/", "-").replace("_", "-")
+    model_slug = args.model_name.split("/")[-1].replace("_", "-")  # use original name not local path
     run_name   = (
         f"ser-{model_slug}-{args.mode}-{benchmark}-"
         f"r{args.lora_r if args.mode == 'lora' else 'full'}-"
-        f"audio{max_audio_len}s"
+        f"audio{max_audio_len}s-"
+        f"unfreeze{args.unfreeze_top_layers if args.mode == 'lora' else 'all'}"
     )
     output_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(output_dir, exist_ok=True)
@@ -388,8 +390,9 @@ def train(args):
         greater_is_better=True,
 
         logging_steps=args.log_steps,
-        report_to=[],
+        report_to=["tensorboard"],
         run_name=run_name,
+        logging_dir=f"/scratch/zt1/project/msml604/user/mokshdag/tensorboard_logs/{run_name}",
 
         dataloader_num_workers=1,
         remove_unused_columns=False,
