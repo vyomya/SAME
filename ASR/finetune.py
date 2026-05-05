@@ -70,17 +70,9 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, List, Optional, Union
 from jiwer import wer as jiwer_wer
-from datasets import (
-    load_dataset,
-    Audio,
-    IterableDataset,
-    Dataset,
+from datasets import ( load_dataset, Audio, IterableDataset, Dataset,
 )
-from transformers import (
-    WhisperForConditionalGeneration,
-    WhisperProcessor,
-    Seq2SeqTrainer,
-    Seq2SeqTrainingArguments,
+from transformers import ( WhisperForConditionalGeneration, WhisperProcessor, Seq2SeqTrainer, Seq2SeqTrainingArguments,
 )
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from peft import (
@@ -302,10 +294,6 @@ def load_benchmark_dataset(
     return dataset
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PREPROCESSING
-# ─────────────────────────────────────────────────────────────────────────────
-
 def prepare_dataset(
     batch,
     processor,
@@ -405,9 +393,6 @@ def apply_preprocessing(
     return dataset
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATA COLLATOR
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class WhisperDataCollator:
@@ -441,10 +426,6 @@ class WhisperDataCollator:
         batch["labels"] = labels
         return batch
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# METRICS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def make_compute_metrics(processor):
 
@@ -811,10 +792,6 @@ def train(args):
     return output_dir
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EVALUATION
-# ─────────────────────────────────────────────────────────────────────────────
-
 def normalize_text(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^a-z0-9\s\']", "", text)
@@ -863,7 +840,6 @@ def evaluate_checkpoint(args):
     bench_info = BENCHMARK_REGISTRY.get(benchmark, BENCHMARK_REGISTRY["librispeech"])
     text_column = bench_info["text_column"]
 
-    # ── Load processor ────────────────────────────────────────────────────────
     proc_path = (
         checkpoint_dir
         if os.path.exists(os.path.join(checkpoint_dir, "preprocessor_config.json"))
@@ -997,10 +973,6 @@ def evaluate_checkpoint(args):
     return summary
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SWEEP
-# ─────────────────────────────────────────────────────────────────────────────
-
 def run_sweep(args):
     sizes = args.sweep_sizes.split(",")
     modes = args.sweep_modes.split(",")
@@ -1057,9 +1029,6 @@ def run_sweep(args):
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(

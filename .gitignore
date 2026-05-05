@@ -6,3 +6,4 @@ eval_results_v100/
 evaluated_checkpoints/
 *.log
 ASR/__pycache__/
+*.pyc
