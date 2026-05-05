@@ -10,16 +10,24 @@ Streaming support:
   --max_train_samples   cap training samples (works with or without streaming)
   --max_eval_samples    cap eval samples
 
+Axes of compute reduction (aligned with Wang et al.):
+  xN → --model_size   : model capacity (tiny/small/medium/large-v3)
+  xT → --total_frames : audio duration truncation (fewer encoder frames)
+  xV → --tokens_per_frame : encoder output subsampling before decoder cross-attn
+
 Can be used standalone OR imported/called by run_experiment.py.
 
 Usage (standalone):
   python whisper_finetune.py --model_size small --mode lora --streaming
   python whisper_finetune.py --model_size small --mode lora --max_train_samples 2000
 
-Usage (called from run_experiment.py):
-  python run_experiment.py --task asr --benchmark_dataset librispeech \\
-      --llm_size small --tokens_per_frame 1 --total_frames 1500 \\
-      --streaming -- --mode lora --lora_r 32
+3-way experiment:
+  # Run A — baseline
+  python whisper_finetune.py --total_frames 1500 --tokens_per_frame 1
+  # Run B — audio clipping
+  python whisper_finetune.py --total_frames 750  --tokens_per_frame 1
+  # Run C — encoder subsampling
+  python whisper_finetune.py --total_frames 1500 --tokens_per_frame 2
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -36,16 +44,17 @@ os.environ["LD_LIBRARY_PATH"] = (
     + os.environ.get("LD_LIBRARY_PATH", "")
 )
 local_path = {
-    "small":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d",
-    "medium": "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-medium/snapshots/abdf7c39ab9d0397620ccaea8974cc764cd0953e", 
-    "tiny":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af", 
-    "large-v3":"/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1"
+    "small":    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d",
+    "medium":   "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-medium/snapshots/abdf7c39ab9d0397620ccaea8974cc764cd0953e",
+    "tiny":     "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af",
+    "large-v3": "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1",
 }
 os.environ["HF_HOME"]               = CACHE_DIR
 os.environ["HF_DATASETS_CACHE"]     = f"{CACHE_DIR}/datasets"
 os.environ["TRANSFORMERS_CACHE"]    = f"{CACHE_DIR}/models"
 os.environ["HUGGINGFACE_HUB_CACHE"] = f"{CACHE_DIR}/hub"
-os.environ["DATASETS_AUDIO_BACKEND"]    = "soundfile"
+os.environ["DATASETS_AUDIO_BACKEND"] = "soundfile"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # IMPORTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,6 +82,7 @@ from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
 )
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -94,24 +104,18 @@ WHISPER_SIZES = {
 
 SUPPORTED_TASKS = ["asr", "translation"]
 
-# ── Benchmark dataset registry ────────────────────────────────────────────────
-#
-# LibriSpeech HF split names (librispeech_asr):
-#   clean config : train.100, train.360, validation, test
-#   other config : train.500, validation, test
-#
 BENCHMARK_REGISTRY = {
     "librispeech": {
         "hf_path":       "librispeech_asr",
         "text_column":   "text",
         "language":      "English",
-        "default_train": "train.100",     # clean config
-        "default_eval":  "validation",    # clean config
-        "default_test":  [                # loaded separately per config
+        "default_train": "train.100",
+        "default_eval":  "validation",
+        "default_test":  [
             ("clean", "test"),
             ("other", "test"),
         ],
-        "task":          "transcribe",
+        "task": "transcribe",
     },
     "common_voice": {
         "hf_path":       "mozilla-foundation/common_voice_13_0",
@@ -145,9 +149,100 @@ BENCHMARK_REGISTRY = {
     },
 }
 
-# LoRA: apply to q_proj and v_proj across all attention layers
-# (encoder self-attn, decoder self-attn, decoder cross-attn)
 LORA_TARGET_MODULES = ["q_proj", "v_proj"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBSAMPLING WRAPPER  (xV axis — Wang et al.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WhisperWithTokenSubsampling(torch.nn.Module):
+    """
+    Wraps WhisperForConditionalGeneration (or a PeftModel around it) to
+    subsample encoder hidden states BEFORE they are passed to the decoder's
+    cross-attention layers.
+
+    This is the xV axis from Wang et al.:
+      tokens_per_frame=1 → all 1500 encoder frames reach the decoder  (baseline)
+      tokens_per_frame=2 → every 2nd frame → 750 frames
+      tokens_per_frame=4 → every 4th frame → 375 frames
+
+    Cross-attention FLOPs scale as:
+      FLOPs ∝ L_decoder × L_encoder × d_model
+    so halving L_encoder halves decoder cross-attention cost.
+
+    The encoder still processes the full (128, 3000) spectrogram — only the
+    hidden states passed to the decoder are thinned.  To reduce encoder cost
+    too, use --total_frames (xT axis), which clips the audio before encoding.
+
+    Saving / loading
+    ----------------
+    Only the *inner* model's weights are saved (LoRA adapters or full weights).
+    The wrapper itself has no learnable parameters and is re-applied at eval
+    time by passing --tokens_per_frame to evaluate_checkpoint.
+    """
+
+    def __init__(self, base_model: torch.nn.Module, tokens_per_frame: int = 1):
+        super().__init__()
+        self.model            = base_model
+        self.tokens_per_frame = tokens_per_frame
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _subsample(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Stride-subsample encoder hidden states along the time axis."""
+        if self.tokens_per_frame > 1:
+            hidden = hidden[:, :: self.tokens_per_frame, :]
+        return hidden
+
+    def _encode_and_subsample(self, input_features: torch.Tensor):
+        """Run encoder, subsample, return patched BaseModelOutput."""
+        # Access the underlying WhisperModel regardless of PEFT wrapping
+        base = self.model
+        # PeftModel wraps the model under .base_model.model; plain
+        # WhisperForConditionalGeneration exposes .model directly.
+        whisper_model = getattr(base, "model", base)           # WhisperModel
+        encoder       = getattr(whisper_model, "model", whisper_model).encoder \
+                        if hasattr(whisper_model, "model") \
+                        else whisper_model.encoder
+
+        encoder_out = encoder(input_features)
+        encoder_out.last_hidden_state = self._subsample(
+            encoder_out.last_hidden_state
+        )
+        return encoder_out
+
+    # ------------------------------------------------------------------
+    # forward  (used during training by Seq2SeqTrainer)
+    # ------------------------------------------------------------------
+    def forward(self, input_features, labels=None, **kwargs):
+        encoder_out = self._encode_and_subsample(input_features)
+        return self.model(
+            encoder_outputs=encoder_out,
+            labels=labels,
+            **kwargs,
+        )
+
+    # ------------------------------------------------------------------
+    # generate  (used during inference / evaluation)
+    # ------------------------------------------------------------------
+    def generate(self, input_features, **kwargs):
+        encoder_out = self._encode_and_subsample(input_features)
+        return self.model.generate(
+            encoder_outputs=encoder_out,
+            **kwargs,
+        )
+
+    # ------------------------------------------------------------------
+    # Delegate attribute access to inner model so that Trainer, PEFT,
+    # processor helpers, etc. all continue to work transparently.
+    # ------------------------------------------------------------------
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.model, name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,11 +250,6 @@ LORA_TARGET_MODULES = ["q_proj", "v_proj"]
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _librispeech_config_for_split(split: str) -> str:
-    """
-    Derive the HF config ('clean' or 'other') from the split name.
-      train.100, train.360, validation, test  → clean
-      train.500                               → other
-    """
     return "other" if "500" in split else "clean"
 
 
@@ -171,20 +261,6 @@ def load_benchmark_dataset(
     max_samples:     Optional[int] = None,
     config_override: Optional[str] = None,
 ) -> Union[Dataset, IterableDataset]:
-    """
-    Load a benchmark dataset split.
-
-    Args:
-        benchmark       : key in BENCHMARK_REGISTRY
-        split           : split name (e.g. 'train.100', 'validation', 'test')
-        sampling_rate   : resample audio to this rate (ignored in streaming mode
-                          — resampling happens per-sample in prepare_dataset)
-        streaming       : if True, stream audio on the fly with zero disk cache.
-                          Returns an IterableDataset instead of a Dataset.
-        max_samples     : cap the number of samples. Uses .take() for streaming,
-                          .select() for non-streaming.
-        config_override : force a specific HF config (e.g. 'other' for librispeech)
-    """
     if benchmark not in BENCHMARK_REGISTRY:
         raise ValueError(
             f"Unknown benchmark '{benchmark}'. "
@@ -192,7 +268,6 @@ def load_benchmark_dataset(
         )
     info = BENCHMARK_REGISTRY[benchmark]
 
-    # Resolve config
     if config_override is not None:
         config = config_override
     elif benchmark == "librispeech":
@@ -214,15 +289,13 @@ def load_benchmark_dataset(
         trust_remote_code=True,
     )
 
-    # Cap samples
     if max_samples is not None:
         if streaming:
-            dataset = dataset.take(max_samples)      # IterableDataset
+            dataset = dataset.take(max_samples)
         else:
             n = min(max_samples, len(dataset))
-            dataset = dataset.select(range(n))       # Dataset
+            dataset = dataset.select(range(n))
 
-    # Cast audio column for non-streaming (streaming resamples on-the-fly)
     if not streaming:
         dataset = dataset.cast_column("audio", Audio(sampling_rate=sampling_rate))
 
@@ -245,42 +318,40 @@ def prepare_dataset(
     """
     Converts raw audio + transcript into model inputs.
 
-    Axis mapping to the paper:
-      xN → model_size  (handled at model build time)
-      xT → total_frames (truncates audio here — fewer encoder frames)
-      xV → tokens_per_frame (NOT applied here — applied in model.forward()
-                              by subsampling encoder hidden states before decoder)
+    Axis mapping (Wang et al.):
+      xN → model_size      — handled at model build time
+      xT → total_frames    — clips audio HERE (fewer active encoder frames)
+      xV → tokens_per_frame — NOT applied here; applied in model.forward()
+                              via WhisperWithTokenSubsampling
 
-    Always produces input_features of shape (128, 3000) so Whisper's
-    Conv1d layers and positional embeddings receive a valid fixed-size input.
+    Feature extractor always pads/truncates to (128, 3000) so Whisper's
+    Conv1d layers and positional embeddings receive a valid fixed-size input
+    even when audio has been clipped.
     """
     audio       = batch["audio"]
     audio_array = np.array(audio["array"], dtype=np.float32)
     audio_sr    = audio["sampling_rate"]
 
-    # ── Resample if needed (critical for streaming where cast_column wasn't called)
+    # Resample if needed (critical for streaming mode)
     if audio_sr != sampling_rate:
         waveform    = torch.tensor(audio_array).unsqueeze(0)
         resampler   = torchaudio.transforms.Resample(audio_sr, sampling_rate)
         audio_array = resampler(waveform).squeeze(0).numpy().astype(np.float32)
 
-    # ── xT axis: truncate audio to control duration ───────────────────────────
-    # total_frames=1500 → 30s (full Whisper window)
-    # total_frames=750  → 15s
-    # total_frames=375  → 7.5s
+    # xT axis: clip audio to control active duration sent to encoder
+    #   total_frames=1500 → 30 s  (full window)
+    #   total_frames=750  → 15 s
+    #   total_frames=375  →  7.5 s
     max_audio_samples = int((total_frames / 1500) * 30 * sampling_rate)
     audio_array = audio_array[:max_audio_samples]
 
-    # ── Feature extraction — always outputs (128, 3000) ───────────────────────
-    # WhisperFeatureExtractor pads short arrays to fill the full window,
-    # so truncated audio still produces a valid (128, 3000) tensor.
-    # xV subsampling is NOT done here — it happens inside model.forward().
+    # Feature extraction — always outputs (128, 3000)
     batch["input_features"] = processor.feature_extractor(
         audio_array,
         sampling_rate=sampling_rate,
-    ).input_features[0]   # shape: (128, 3000) always
+    ).input_features[0]
 
-    # ── Label tokenization ────────────────────────────────────────────────────
+    # Label tokenisation
     transcript = batch[text_column]
     if isinstance(transcript, str):
         transcript = transcript.lower()
@@ -291,7 +362,8 @@ def prepare_dataset(
         truncation=True,
     ).input_ids
 
-    return batch 
+    return batch
+
 
 def apply_preprocessing(
     dataset:          Union[Dataset, IterableDataset],
@@ -303,15 +375,6 @@ def apply_preprocessing(
     num_proc:         int = 1,
     sampling_rate:    int = 16_000,
 ) -> Union[Dataset, IterableDataset]:
-    """
-    Apply prepare_dataset to a full dataset.
-
-    Handles the key difference between Dataset and IterableDataset:
-      - Dataset       : .map() supports num_proc for parallel processing
-      - IterableDataset: .map() is single-threaded, no num_proc, no remove_columns
-                         by name (must pass column names explicitly or use
-                         batched=False with remove_columns=None)
-    """
     map_fn = partial(
         prepare_dataset,
         processor=processor,
@@ -323,7 +386,6 @@ def apply_preprocessing(
     )
 
     if isinstance(dataset, IterableDataset):
-        # Streaming: single-threaded map, keep only needed columns
         dataset = dataset.map(
             map_fn,
             remove_columns=["file", "audio", text_column,
@@ -331,12 +393,11 @@ def apply_preprocessing(
             load_from_cache_file=False,
         )
     else:
-        # Cached: parallel map with num_proc
         dataset = dataset.map(
             map_fn,
             remove_columns=dataset.column_names,
             num_proc=1,
-            writer_batch_size=50, # for Large models
+            writer_batch_size=50,
             desc="Preprocessing",
             load_from_cache_file=False,
         )
@@ -353,14 +414,11 @@ class WhisperDataCollator:
     """
     Pads input_features and labels into batches.
     Labels padded with -100 so padding is ignored in cross-entropy loss.
-    Works identically for streaming and non-streaming datasets since by the
-    time the collator sees data, it's already been preprocessed into tensors.
     """
     processor: Any
     fp16: bool = False
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # Audio features — already (128, 3000), just stack
         input_features = [{"input_features": f["input_features"]} for f in features]
         batch = self.processor.feature_extractor.pad(
             input_features, return_tensors="pt"
@@ -368,7 +426,7 @@ class WhisperDataCollator:
 
         if self.fp16:
             batch["input_features"] = batch["input_features"].half()
-        # Labels — pad with -100
+
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.processor.tokenizer.pad(
             label_features, return_tensors="pt"
@@ -377,7 +435,6 @@ class WhisperDataCollator:
             labels_batch.attention_mask.ne(1), -100
         )
 
-        # Strip BOS if tokenizer prepended it
         if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all():
             labels = labels[:, 1:]
 
@@ -414,40 +471,116 @@ def make_compute_metrics(processor):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM TRAINER — fixes shared-tensor safetensors crash with PEFT/LoRA
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PeftSafeSeq2SeqTrainer(Seq2SeqTrainer):
+    """
+    Seq2SeqTrainer subclass that saves LoRA checkpoints correctly.
+
+    Root cause of the crash
+    -----------------------
+    Whisper ties proj_out.weight ↔ embed_tokens.weight.  When a PeftModel
+    (or a WhisperWithTokenSubsampling wrapper around one) is passed to the
+    standard Trainer, its internal _save() calls safetensors.save_file(),
+    which raises RuntimeError on shared-memory tensors.
+
+    Fix
+    ---
+    Override _save() to:
+      1. Unwrap WhisperWithTokenSubsampling if present.
+      2. If the inner model is a PeftModel, use peft's save_pretrained()
+         which handles tied weights safely.
+      3. Otherwise fall back to the standard Trainer._save().
+    """
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        model = self.model
+
+        # Unwrap subsampling wrapper — it has no weights of its own
+        if isinstance(model, WhisperWithTokenSubsampling):
+            model = model.model
+
+        if isinstance(model, PeftModel):
+            # PEFT's save_pretrained handles tied weights correctly
+            model.save_pretrained(output_dir)
+            # Also save the tokenizer / processor config if the trainer holds it
+            if self.processing_class is not None:
+                self.processing_class.save_pretrained(output_dir)
+        else:
+            # Full fine-tune: delegate to the standard HF save path
+            super()._save(output_dir, state_dict)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODEL SETUP
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_model_full(model_name: str,fp16 = False) -> WhisperForConditionalGeneration:
-    """All weights trainable."""
-    dtype = torch.float16 if fp16 else torch.float32
-    print(f"Loading {model_name} (full finetune)...")
-    model = WhisperForConditionalGeneration.from_pretrained(model_name,torch_dtype=dtype)
-    model.config.forced_decoder_ids = None
-    model.generation_config.suppress_tokens = []
-    model.config.use_cache          = False   # required for gradient checkpointing
-    total = sum(p.numel() for p in model.parameters())
-    print(f"  Total params: {total:,} | All trainable")
+def _wrap_if_subsampling(
+    model: torch.nn.Module,
+    tokens_per_frame: int,
+) -> torch.nn.Module:
+    """
+    Conditionally wrap model with WhisperWithTokenSubsampling.
+    No-op when tokens_per_frame == 1 (baseline).
+    """
+    if tokens_per_frame > 1:
+        model = WhisperWithTokenSubsampling(model, tokens_per_frame)
+        n_out = 1500 // tokens_per_frame
+        print(
+            f"  [xV] Encoder output subsampled: stride={tokens_per_frame} "
+            f"→ {n_out} tokens reach the decoder  "
+            f"(cross-attn FLOPs ≈ {tokens_per_frame}× reduction)"
+        )
+    else:
+        print("  [xV] No encoder subsampling (tokens_per_frame=1, baseline)")
     return model
 
 
+def build_model_full(
+    model_name:       str,
+    fp16:             bool = False,
+    tokens_per_frame: int  = 1,
+) -> torch.nn.Module:
+    """All weights trainable, optional xV subsampling wrapper."""
+    dtype = torch.float16 if fp16 else torch.float32
+    print(f"Loading {model_name} (full finetune)...")
+    model = WhisperForConditionalGeneration.from_pretrained(
+        model_name, torch_dtype=dtype
+    )
+    model.config.forced_decoder_ids        = None
+    model.generation_config.suppress_tokens = []
+    model.config.use_cache                 = False
+
+    total = sum(p.numel() for p in model.parameters())
+    print(f"  Total params: {total:,} | All trainable")
+
+    return _wrap_if_subsampling(model, tokens_per_frame)
+
+
 def build_model_lora(
-    model_name:   str,
-    lora_r:       int   = 32,
-    lora_alpha:   int   = 64,
-    lora_dropout: float = 0.05,
-    fp16:         bool  = False
-) -> WhisperForConditionalGeneration:
+    model_name:       str,
+    lora_r:           int   = 32,
+    lora_alpha:       int   = 64,
+    lora_dropout:     float = 0.05,
+    fp16:             bool  = False,
+    tokens_per_frame: int   = 1,
+) -> torch.nn.Module:
     """
-    LoRA on q_proj + v_proj across:
-      encoder self-attn, decoder self-attn, decoder cross-attn (encoder_attn).
-    Reduces trainable params to ~1% while preserving general speech knowledge.
+    LoRA on q_proj + v_proj across encoder self-attn, decoder self-attn,
+    and decoder cross-attn.  Optional xV subsampling wrapper applied on top.
     """
     dtype = torch.float16 if fp16 else torch.float32
     print(f"Loading {model_name} (LoRA r={lora_r}, alpha={lora_alpha})...")
-    model = WhisperForConditionalGeneration.from_pretrained(model_name,torch_dtype=dtype,)
-    model.config.forced_decoder_ids = None
+    model = WhisperForConditionalGeneration.from_pretrained(
+        model_name, torch_dtype=dtype
+    )
+    model.config.forced_decoder_ids        = None
     model.generation_config.suppress_tokens = []
-    model.config.use_cache          = False
+    model.config.use_cache                 = False
 
     lora_cfg = LoraConfig(
         r=lora_r,
@@ -458,7 +591,8 @@ def build_model_lora(
     )
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
-    return model
+
+    return _wrap_if_subsampling(model, tokens_per_frame)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -466,7 +600,6 @@ def build_model_lora(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(args):
-    # ── Resolve benchmark / task config ──────────────────────────────────────
     benchmark  = getattr(args, "benchmark_dataset", "librispeech")
     task       = getattr(args, "task",              "asr")
     bench_info = BENCHMARK_REGISTRY.get(benchmark, BENCHMARK_REGISTRY["librispeech"])
@@ -479,29 +612,34 @@ def train(args):
     tokens_per_frame = getattr(args, "tokens_per_frame", 1)
     total_frames     = getattr(args, "total_frames",     1500)
 
-    # ── Streaming / sample cap args ───────────────────────────────────────────
-    streaming         = getattr(args, "streaming",          False)
-    max_train_samples = getattr(args, "max_train_samples",  None)
-    max_eval_samples  = getattr(args, "max_eval_samples",   None)
+    streaming         = getattr(args, "streaming",         False)
+    max_train_samples = getattr(args, "max_train_samples", None)
+    max_eval_samples  = getattr(args, "max_eval_samples",  None)
 
     model_name = local_path[args.model_size]
-    run_name   = f"whisper-{args.model_size}-{args.mode}-{benchmark}-{task}-{tokens_per_frame}-{total_frames}-v100"
+    run_name   = (
+        f"whisper-{args.model_size}-{args.mode}-{benchmark}-{task}"
+        f"-tpf{tokens_per_frame}-tf{total_frames}-v100"
+    )
     output_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"\nCache directory : {CACHE_DIR}")
+    print(f"\nRun             : {run_name}")
+    print(f"Cache directory : {CACHE_DIR}")
     print(f"Streaming mode  : {streaming}")
+    print(f"[xT] total_frames     = {total_frames}  "
+          f"(active audio = {total_frames/1500*30:.1f}s)")
+    print(f"[xV] tokens_per_frame = {tokens_per_frame}  "
+          f"(decoder sees {1500//tokens_per_frame} encoder tokens)")
     if max_train_samples:
-        print(f"Max train samples: {max_train_samples}")
+        print(f"Max train samples : {max_train_samples}")
     if max_eval_samples:
-        print(f"Max eval  samples: {max_eval_samples}")
+        print(f"Max eval  samples : {max_eval_samples}")
 
-    # ── Processor ─────────────────────────────────────────────────────────────
     processor = WhisperProcessor.from_pretrained(
         model_name, language=language, task=whisper_task
     )
 
-    # ── Load datasets ─────────────────────────────────────────────────────────
     train_dataset = load_benchmark_dataset(
         benchmark, train_split,
         streaming=streaming,
@@ -513,7 +651,6 @@ def train(args):
         max_samples=max_eval_samples,
     )
 
-    # ── Preprocess ────────────────────────────────────────────────────────────
     print("Preprocessing datasets...")
     train_dataset = apply_preprocessing(
         train_dataset, processor,
@@ -532,29 +669,27 @@ def train(args):
         num_proc=args.num_proc if not streaming else 1,
     )
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    # ── Build model (with subsampling wrapper if tokens_per_frame > 1) ────────
     if args.mode == "full":
-        model = build_model_full(model_name,fp16=args.fp16)
+        model = build_model_full(
+            model_name,
+            fp16=args.fp16,
+            tokens_per_frame=tokens_per_frame,
+        )
     elif args.mode == "lora":
         model = build_model_lora(
             model_name,
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            fp16=args.fp16
+            fp16=args.fp16,
+            tokens_per_frame=tokens_per_frame,
         )
     else:
         raise ValueError(f"Unknown mode '{args.mode}'. Choose 'full' or 'lora'.")
 
-    collator = WhisperDataCollator(processor=processor,fp16=args.fp16)
+    collator = WhisperDataCollator(processor=processor, fp16=args.fp16)
 
-    # ── Training arguments ────────────────────────────────────────────────────
-    #
-    # Streaming notes:
-    #   - evaluation_strategy must be "steps" (not "epoch") for IterableDataset
-    #   - load_best_model_at_end=False for streaming (can't rewind IterableDataset)
-    #   - dataloader_num_workers should be 0 for streaming to avoid pipe errors
-    #
     is_streaming = isinstance(train_dataset, IterableDataset)
 
     training_args = Seq2SeqTrainingArguments(
@@ -573,7 +708,7 @@ def train(args):
         fp16=args.fp16 and torch.cuda.is_available(),
         gradient_checkpointing=True,
 
-        eval_strategy="steps",       # required for streaming
+        eval_strategy="steps",
         eval_steps=args.eval_steps,
         predict_with_generate=True,
         generation_max_length=args.max_label_len,
@@ -581,7 +716,7 @@ def train(args):
         save_strategy="steps",
         save_steps=args.eval_steps,
         save_total_limit=2,
-        load_best_model_at_end=not is_streaming,   # False for streaming
+        load_best_model_at_end=(not is_streaming and args.mode == "full"),  # False for LoRA: PEFT saves adapter_model.safetensors, not pytorch_model.bin
         metric_for_best_model="wer",
         greater_is_better=False,
 
@@ -589,13 +724,11 @@ def train(args):
         report_to=["tensorboard"],
         run_name=run_name,
 
-        # Use 0 workers for streaming to avoid DataLoader pipe errors
         dataloader_num_workers=0 if is_streaming else args.num_proc,
         remove_unused_columns=False,
     )
 
-    # ── Trainer ───────────────────────────────────────────────────────────────
-    trainer = Seq2SeqTrainer(
+    trainer = PeftSafeSeq2SeqTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -605,7 +738,6 @@ def train(args):
         processing_class=processor.feature_extractor,
     )
 
-    # ── Print summary ─────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"  Run     : {run_name}")
     print(f"  Mode    : {args.mode} | Streaming: {is_streaming}")
@@ -614,22 +746,48 @@ def train(args):
         print(f"  Eval    : {len(eval_dataset):,} samples")
     print(f"{'='*60}\n")
 
-    # ── Train ─────────────────────────────────────────────────────────────────
     t0 = time.time()
     trainer.train()
     elapsed = time.time() - t0
     print(f"\nTraining complete in {elapsed/3600:.2f}h")
 
     # ── Save ──────────────────────────────────────────────────────────────────
+    # For LoRA: load_best_model_at_end is disabled (PEFT/safetensors conflict),
+    # so we manually find the best checkpoint from trainer state and copy it
+    # to output_dir.  For full fine-tune, trainer.save_model() is sufficient.
     if args.mode == "lora":
-        model.save_pretrained(output_dir)
+        best_ckpt = getattr(trainer.state, "best_model_checkpoint", None)
+        if best_ckpt and os.path.isdir(best_ckpt):
+            print(f"  Best checkpoint: {best_ckpt}  (copying to {output_dir})")
+            import shutil
+            for fname in os.listdir(best_ckpt):
+                src = os.path.join(best_ckpt, fname)
+                dst = os.path.join(output_dir, fname)
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+        else:
+            # Fallback: save current model weights (last checkpoint)
+            print("  No best_model_checkpoint recorded; saving current weights.")
+            trainer.save_model(output_dir)
     else:
         trainer.save_model(output_dir)
+
     processor.save_pretrained(output_dir)
 
-    # ── Run metadata ──────────────────────────────────────────────────────────
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total     = sum(p.numel() for p in model.parameters())
+    # Save tokens_per_frame and total_frames into the checkpoint directory
+    # so evaluate_checkpoint can reload them automatically
+    experiment_cfg = {
+        "tokens_per_frame": tokens_per_frame,
+        "total_frames":     total_frames,
+        "model_size":       args.model_size,
+        "mode":             args.mode,
+    }
+    with open(os.path.join(output_dir, "experiment_cfg.json"), "w") as f:
+        json.dump(experiment_cfg, f, indent=2)
+
+    _inner    = model.model if isinstance(model, WhisperWithTokenSubsampling) else model
+    trainable = sum(p.numel() for p in _inner.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in _inner.parameters())
     meta = {
         "model_size":        args.model_size,
         "mode":              args.mode,
@@ -667,10 +825,37 @@ def normalize_text(text: str) -> str:
 def evaluate_checkpoint(args):
     """
     Load a saved checkpoint and run WER + RTF evaluation on test splits.
-    Always streams eval data to avoid disk usage.
+
+    Automatically reads tokens_per_frame and total_frames from the checkpoint's
+    experiment_cfg.json (written by train()).  Command-line values override
+    if explicitly provided.
+
+    Key fix vs original: total_frames truncation is NOW applied during eval
+    (previously eval always used full 30 s audio regardless of total_frames).
     """
     checkpoint_dir = args.checkpoint
     assert checkpoint_dir, "--checkpoint required for eval_only mode"
+
+    # ── Load experiment config saved by train() ───────────────────────────────
+    cfg_path = os.path.join(checkpoint_dir, "experiment_cfg.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            saved_cfg = json.load(f)
+        print(f"Loaded experiment config from checkpoint: {saved_cfg}")
+    else:
+        saved_cfg = {}
+        print("No experiment_cfg.json found; using args values.")
+
+    # Command-line args override saved config (so you can test cross-settings)
+    tokens_per_frame = getattr(args, "tokens_per_frame", None) \
+                       or saved_cfg.get("tokens_per_frame", 1)
+    total_frames     = getattr(args, "total_frames", None) \
+                       or saved_cfg.get("total_frames", 1500)
+
+    print(f"[xT] total_frames     = {total_frames}  "
+          f"(eval audio clipped to {total_frames/1500*30:.1f}s)")
+    print(f"[xV] tokens_per_frame = {tokens_per_frame}  "
+          f"(decoder sees {1500//tokens_per_frame} encoder tokens)")
 
     device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_name = local_path[args.model_size]
@@ -688,28 +873,33 @@ def evaluate_checkpoint(args):
         proc_path, language="English", task="transcribe"
     )
 
-    # ── Load model ────────────────────────────────────────────────────────────
+    # ── Load inner model (no wrapper yet) ────────────────────────────────────
+    dtype = torch.float16 if getattr(args, "fp16", True) else torch.float32
+
     if args.mode == "lora":
-        dtype = torch.float16 if getattr(args, "fp16", True) else torch.float32
         base = WhisperForConditionalGeneration.from_pretrained(
-            model_name,
-            torch_dtype=dtype,             # ← was missing here
+            model_name, torch_dtype=dtype
         )
         base.config.forced_decoder_ids = None
         model = PeftModel.from_pretrained(base, checkpoint_dir)
-        model = model.merge_and_unload()
+        model = model.merge_and_unload()   # fuse LoRA → plain WhisperForConditionalGeneration
     else:
-        dtype = torch.float16 if getattr(args, "fp16", True) else torch.float32
         model = WhisperForConditionalGeneration.from_pretrained(
-            checkpoint_dir,
-            torch_dtype=dtype,             # ← was missing here too
+            checkpoint_dir, torch_dtype=dtype
         )
 
     model.config.forced_decoder_ids = None
+
+    # ── Re-apply subsampling wrapper if needed (xV axis) ─────────────────────
+    # This MUST happen after merge_and_unload() so the wrapper sees a plain
+    # WhisperForConditionalGeneration, not a PeftModel.
+    if tokens_per_frame > 1:
+        model = WhisperWithTokenSubsampling(model, tokens_per_frame)
+        print(f"  Subsampling wrapper applied: stride={tokens_per_frame}")
+
     model = model.to(device).eval()
 
-    # ── Load test splits (always streaming for eval — no disk needed) ─────────
-    # librispeech needs separate loads for clean vs other
+    # ── Load test splits ──────────────────────────────────────────────────────
     if benchmark == "librispeech":
         eval_splits = {
             "test_clean": load_benchmark_dataset(
@@ -730,7 +920,11 @@ def evaluate_checkpoint(args):
                 max_samples=getattr(args, "max_eval_samples", None),
             )
 
-    results    = {}
+    results = {}
+    fp16    = getattr(args, "fp16", True)
+
+    # Pre-compute audio clip length in samples (xT axis applied at eval too)
+    max_audio_samples = int((total_frames / 1500) * 30 * 16_000)
 
     for split_name, dataset in eval_splits.items():
         print(f"\nEvaluating on {split_name} ...")
@@ -741,13 +935,18 @@ def evaluate_checkpoint(args):
         for sample in tqdm.tqdm(dataset):
             audio_array = sample["audio"]["array"].astype(np.float32)
             ref_text    = sample[text_column].lower().strip()
-            audio_dur_s = len(audio_array) / 16_000
-            fp16 = getattr(args, "fp16", True) 
+
+            # xT: clip audio to match training condition
+            audio_array   = audio_array[:max_audio_samples]
+            audio_dur_s   = len(audio_array) / 16_000
+
             features = processor.feature_extractor(
                 audio_array, sampling_rate=16_000, return_tensors="pt"
             ).input_features.to(device)
+
             if fp16:
-                features = features.half() 
+                features = features.half()
+
             t0 = time.time()
             with torch.no_grad():
                 pred_ids = model.generate(
@@ -775,14 +974,20 @@ def evaluate_checkpoint(args):
         }
         print(f"  WER: {results[split_name]['wer']:.3f}% | RTF: {rtf:.4f}")
 
-    total_params = sum(p.numel() for p in model.parameters())
+    total_params = sum(
+        p.numel() for p in
+        (model.model.parameters() if isinstance(model, WhisperWithTokenSubsampling)
+         else model.parameters())
+    )
     summary = {
-        "model_size":   args.model_size,
-        "mode":         args.mode,
-        "total_params": total_params,
-        "results":      results,
+        "model_size":        args.model_size,
+        "mode":              args.mode,
+        "tokens_per_frame":  tokens_per_frame,
+        "total_frames":      total_frames,
+        "total_params":      total_params,
+        "results":           results,
     }
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print(json.dumps(summary, indent=2))
 
     out_path = os.path.join(checkpoint_dir, "eval_results.json")
@@ -813,18 +1018,24 @@ def run_sweep(args):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            eval_summary   = evaluate_checkpoint(
+
+            eval_summary = evaluate_checkpoint(
                 argparse.Namespace(
                     model_size=size,
                     mode=mode,
                     checkpoint=checkpoint_dir,
                     benchmark_dataset=getattr(args, "benchmark_dataset", "librispeech"),
                     max_eval_samples=getattr(args, "max_eval_samples", None),
+                    fp16=getattr(args, "fp16", True),
+                    # tokens_per_frame / total_frames loaded from experiment_cfg.json
+                    tokens_per_frame=None,
+                    total_frames=None,
                 )
             )
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
             meta_path = os.path.join(checkpoint_dir, "run_meta.json")
             with open(meta_path) as f:
                 meta = json.load(f)
@@ -836,10 +1047,11 @@ def run_sweep(args):
                 json.dump(all_results, f, indent=2)
             print(f"Sweep results saved to {sweep_path}")
 
-    print("\n" + "="*60 + "\nSWEEP COMPLETE\n" + "="*60)
+    print("\n" + "=" * 60 + "\nSWEEP COMPLETE\n" + "=" * 60)
     for r in all_results:
         print(
             f"  whisper-{r['model_size']:10s} | {r['mode']:5s} | "
+            f"tpf={r['tokens_per_frame']} tf={r['total_frames']} | "
             f"trainable={r['trainable_params']:>12,} | "
             f"WER test_clean={r.get('test_clean', {}).get('wer', 'N/A')}%"
         )
@@ -856,10 +1068,14 @@ def parse_args(argv=None):
     )
 
     # Experiment identity
-    p.add_argument("--task",              type=str, default="asr",           choices=SUPPORTED_TASKS)
-    p.add_argument("--benchmark_dataset", type=str, default="librispeech",   choices=list(BENCHMARK_REGISTRY.keys()))
-    p.add_argument("--tokens_per_frame",  type=int, default=1)
-    p.add_argument("--total_frames",      type=int, default=1500)
+    p.add_argument("--task",              type=str, default="asr",         choices=SUPPORTED_TASKS)
+    p.add_argument("--benchmark_dataset", type=str, default="librispeech", choices=list(BENCHMARK_REGISTRY.keys()))
+    p.add_argument("--tokens_per_frame",  type=int, default=1,
+                   help="xV axis: subsample encoder hidden states by this stride before decoder. "
+                        "1=baseline (1500 tokens), 2=750 tokens, 4=375 tokens")
+    p.add_argument("--total_frames",      type=int, default=1500,
+                   help="xT axis: clip audio to (total_frames/1500)*30s before encoding. "
+                        "1500=30s full, 750=15s, 375=7.5s")
 
     # Model
     p.add_argument("--model_size", type=str, default="small", choices=list(WHISPER_SIZES.keys()))
@@ -870,12 +1086,9 @@ def parse_args(argv=None):
     p.add_argument("--eval_split",        type=str,  default=None)
     p.add_argument("--max_label_len",     type=int,  default=448)
     p.add_argument("--num_proc",          type=int,  default=1)
-    p.add_argument("--streaming",         action="store_true",
-                   help="Stream dataset on the fly — zero disk cache")
-    p.add_argument("--max_train_samples", type=int,  default=None,
-                   help="Cap training set size (e.g. 2000 for quick runs)")
-    p.add_argument("--max_eval_samples",  type=int,  default=None,
-                   help="Cap eval/test set size")
+    p.add_argument("--streaming",         action="store_true")
+    p.add_argument("--max_train_samples", type=int,  default=None)
+    p.add_argument("--max_eval_samples",  type=int,  default=None)
 
     # LoRA
     p.add_argument("--lora_r",       type=int,   default=32)
