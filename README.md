@@ -252,6 +252,8 @@ pip install -r requirements.txt
 
 ### 2. Prepare the CREMA-D dataset
 
+Download the dataset using the Emotion/crema-d folder in [Drive link](https://drive.google.com/drive/folders/1qbIB4Eg2jpGB6EXmhlAP1Efkyjzr6Nif?usp=share_link)
+
 CREMA-D WAV files should be placed on local cluster storage before training begins to avoid repeated network I/O. The pipeline loads audio directly from local paths on Zaratan HPC.
 
 ```bash
@@ -260,6 +262,29 @@ cp -r /path/to/cremad_wavs /scratch/<your_project>/data/cremad/
 ```
 
 Update the dataset path in `run_emotion_experiment.py` (or pass it via `--data_dir` if supported) to point to your local copy.
+
+---
+
+## Run Inference
+
+- Change the following path to your own local paths inside Emotion/run_inference.py
+  ```
+  CACHE_DIR = "/scratch/zt1/project/msml604/user/mokshdag/hf_cache"
+  LOCAL_MODEL_PATH = {
+      "facebook/wav2vec2-large-robust": f"{CACHE_DIR}/models/wav2vec2-large-robust",
+      "facebook/wav2vec2-base":         f"{CACHE_DIR}/models/wav2vec2-base",
+  }
+  CREMAD_LABEL_MAP = {"NEU": 0, "HAP": 1, "SAD": 2, "ANG": 3, "FEA": 4, "DIS": 5}
+  LABEL_NAMES      = ["neutral", "happy", "sad", "angry", "fear", "disgust"]
+  SAMPLING_RATE    = 16_000
+  AUDIO_DIR        = f"{CACHE_DIR}/datasets/crema-d/data/data/AudioWAV"
+  CHECKPOINTS_DIR  = "/scratch/zt1/project/msml605/user/mokshdag/checkpoints/checkpoints/"
+  OUTPUT_JSON      = "/scratch/zt1/project/msml605/user/mokshdag/inference_results/all_inference_results.json"
+  ```
+- Run the following python command
+  ```
+  
+  ```
 
 ---
 
