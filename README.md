@@ -283,7 +283,7 @@ Update the dataset path in `run_emotion_experiment.py` (or pass it via `--data_d
   ```
 - Run the following python command
   ```
-  
+  python run_inference.py
   ```
 
 ---
