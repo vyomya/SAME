@@ -89,6 +89,37 @@ export LD_LIBRARY_PATH=$CONDA_ENV_LIB:$TORCH_LIB:$CUDA_RUNTIME_LIB:$CUDA_NVRTC_L
 > **Tip:** Add the `export LD_LIBRARY_PATH=...` line to your `~/.bashrc` or SLURM job script so it persists across sessions.
 
 ---
+## Download Dataset locally
+```python -c "
+from datasets import load_dataset
+load_dataset('librispeech_asr', 'clean', split='train.100', cache_dir='/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/datasets')
+load_dataset('librispeech_asr', 'clean', split='validation', cache_dir='/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/datasets')
+load_dataset('librispeech_asr', 'clean', split='test', cache_dir='/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/datasets')
+load_dataset('librispeech_asr', 'other', split='test', cache_dir='/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/datasets')
+print('LibriSpeech done')"
+```
+
+---
+## Running inference
+
+- Download the Checkpoints first from ASR/checkpoints in [Drive link](https://drive.google.com/drive/folders/1qbIB4Eg2jpGB6EXmhlAP1Efkyjzr6Nif?usp=share_link)
+- Change the required local paths within inferece.py from line 72 through 80 to add your own local paths
+  ```
+  CACHE_DIR = "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache"
+  LOCAL_PATH = {
+      "tiny":     "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af",
+      "small":    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d",
+      "medium":   "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-medium/snapshots/abdf7c39ab9d0397620ccaea8974cc764cd0953e",
+      "large-v3": "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1",
+  }
+  ```
+- Run the command: 
+```
+python inference.py --checkpoint_root [your checkpoint path]
+```
+
+
+---
 
 ## Running Experiments
 
