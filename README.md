@@ -267,6 +267,7 @@ Update the dataset path in `run_emotion_experiment.py` (or pass it via `--data_d
 
 ## Run Inference
 
+- Download the Checkpoints first from Emotion/checkpoints/checkpoints in [Drive link](https://drive.google.com/drive/folders/1qbIB4Eg2jpGB6EXmhlAP1Efkyjzr6Nif?usp=share_link)
 - Change the following path to your own local paths inside Emotion/run_inference.py
   ```
   CACHE_DIR = "/scratch/zt1/project/msml604/user/mokshdag/hf_cache"
