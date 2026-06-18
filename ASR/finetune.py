@@ -34,20 +34,24 @@ Usage (standalone):
 # CACHE SETUP — must be before ALL other imports
 # ─────────────────────────────────────────────────────────────────────────────
 import os
-CACHE_DIR = "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache"
-os.environ["LD_LIBRARY_PATH"] = (
-    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib:"
-    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/torch/lib:"
-    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:"
-    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:"
-    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/npp/lib:"
-    + os.environ.get("LD_LIBRARY_PATH", "")
-)
+CACHE_DIR = "/fs/nexus-scratch/vyomwal5/anaconda3/envs/whisper/hf_cache"
+# os.environ["LD_LIBRARY_PATH"] = (
+#     "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib:"
+#     "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/torch/lib:"
+#     "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:"
+#     "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:"
+#     "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/same/lib/python3.11/site-packages/nvidia/npp/lib:"
+#     + os.environ.get("LD_LIBRARY_PATH", "")
+# )
 local_path = {
-    "small":    "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d",
-    "medium":   "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-medium/snapshots/abdf7c39ab9d0397620ccaea8974cc764cd0953e",
-    "tiny":     "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af",
-    "large-v3": "/scratch/zt1/project/msml604/user/vyomwal5/anaconda3/envs/asr/hf_cache/models/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1",
+    "small":    "/fs/nexus-scratch/vyomwal5/models/models/models--openai--whisper-small/snapshots/973afd24965f72e36ca33b3055d56a652f456b4d",
+    "medium":   "/fs/nexus-scratch/vyomwal5/models/models/models--openai--whisper-medium/snapshots/abdf7c39ab9d0397620ccaea8974cc764cd0953e",
+    "tiny":     "/fs/nexus-scratch/vyomwal5/models/models/models--openai--whisper-tiny/snapshots/169d4a4341b33bc18d8881c4b69c2e104e1cc0af",
+    "large-v3": "/fs/nexus-scratch/vyomwal5/models/models/models--openai--whisper-large-v3/snapshots/06f233fe06e710322aca913c1bc4249a0d71fce1",
+    # Distilled — will download on first run; add local paths after caching
+    "distil-small":  "/fs/nexus-scratch/vyomwal5/models/distil-small",
+    "distil-medium": "/fs/nexus-scratch/vyomwal5/models/distil-medium",
+    "distil-large":  "/fs/nexus-scratch/vyomwal5/models/distil-large",
 }
 os.environ["HF_HOME"]               = CACHE_DIR
 os.environ["HF_DATASETS_CACHE"]     = f"{CACHE_DIR}/datasets"
@@ -90,8 +94,11 @@ WHISPER_SIZES = {
     "tiny":     "openai/whisper-tiny",
     "base":     "openai/whisper-base",
     "small":    "openai/whisper-small",
+    "distil-small":  "distil-whisper/distil-small.en",
     "medium":   "openai/whisper-medium",
+    "distil-medium": "distil-whisper/distil-medium.en",
     "large-v3": "openai/whisper-large-v3",
+    "distil-large":  "distil-whisper/distil-large-v3",
 }
 
 SUPPORTED_TASKS = ["asr", "translation"]
@@ -143,7 +150,15 @@ BENCHMARK_REGISTRY = {
 
 LORA_TARGET_MODULES = ["q_proj", "v_proj"]
 
-
+def set_seed(seed: int):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark     = False
 # ─────────────────────────────────────────────────────────────────────────────
 # SUBSAMPLING WRAPPER  (xV axis — Wang et al.)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,15 +204,15 @@ class WhisperWithTokenSubsampling(torch.nn.Module):
         return hidden
 
     def _encode_and_subsample(self, input_features: torch.Tensor):
-        """Run encoder, subsample, return patched BaseModelOutput."""
-        # Access the underlying WhisperModel regardless of PEFT wrapping
+        # Cast input to match model dtype automatically
+        model_dtype = next(self.model.parameters()).dtype
+        input_features = input_features.to(dtype=model_dtype)
+
         base = self.model
-        # PeftModel wraps the model under .base_model.model; plain
-        # WhisperForConditionalGeneration exposes .model directly.
-        whisper_model = getattr(base, "model", base)           # WhisperModel
-        encoder       = getattr(whisper_model, "model", whisper_model).encoder \
-                        if hasattr(whisper_model, "model") \
-                        else whisper_model.encoder
+        whisper_model = getattr(base, "model", base)
+        encoder = getattr(whisper_model, "model", whisper_model).encoder \
+                if hasattr(whisper_model, "model") \
+                else whisper_model.encoder
 
         encoder_out = encoder(input_features)
         encoder_out.last_hidden_state = self._subsample(
@@ -221,10 +236,30 @@ class WhisperWithTokenSubsampling(torch.nn.Module):
     # ------------------------------------------------------------------
     def generate(self, input_features, **kwargs):
         encoder_out = self._encode_and_subsample(input_features)
-        return self.model.generate(
-            encoder_outputs=encoder_out,
-            **kwargs,
+
+        base_model = (
+            self.model.get_base_model()
+            if hasattr(self.model, "get_base_model")
+            else self.model
         )
+
+        original = getattr(base_model, "_maybe_reduce_batch", None)
+        if original is not None:
+            # Use explicit arguments matching the actual signature:
+            # _maybe_reduce_batch(self, input_features, cur_bsz, batch_idx_map)
+            def noop_reduce_batch(input_features=None, cur_bsz=None, 
+                                batch_idx_map=None, **kw):
+                return (input_features, cur_bsz, batch_idx_map)
+            base_model._maybe_reduce_batch = noop_reduce_batch
+
+        try:
+            return self.model.generate(
+                encoder_outputs=encoder_out,
+                **kwargs,
+            )
+        finally:
+            if original is not None:
+                base_model._maybe_reduce_batch = original
 
     # ------------------------------------------------------------------
     # Delegate attribute access to inner model so that Trainer, PEFT,
@@ -378,7 +413,7 @@ def apply_preprocessing(
             map_fn,
             remove_columns=["file", "audio", text_column,
                              "speaker_id", "chapter_id", "id"],
-            load_from_cache_file=False,
+            # load_from_cache_file=False,
         )
     else:
         dataset = dataset.map(
@@ -387,7 +422,7 @@ def apply_preprocessing(
             num_proc=1,
             writer_batch_size=50,
             desc="Preprocessing",
-            load_from_cache_file=False,
+            # load_from_cache_file=False,
         )
 
     return dataset
@@ -581,6 +616,7 @@ def build_model_lora(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(args):
+    set_seed(getattr(args, "seed", 42))
     benchmark  = getattr(args, "benchmark_dataset", "librispeech")
     task       = getattr(args, "task",              "asr")
     bench_info = BENCHMARK_REGISTRY.get(benchmark, BENCHMARK_REGISTRY["librispeech"])
@@ -599,7 +635,7 @@ def train(args):
 
     model_name = local_path[args.model_size]
     run_name   = (
-        f"whisper-{args.model_size}-{args.mode}-{benchmark}-{task}"
+        f"whisper-{args.model_size}-{args.mode}-{args.lora_r}-{benchmark}-{task}"
         f"-tpf{tokens_per_frame}-tf{total_frames}-v100"
     )
     output_dir = os.path.join(args.output_dir, run_name)
@@ -676,6 +712,8 @@ def train(args):
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
 
+        seed=args.seed,          # controls HF Trainer's internal RNG
+        data_seed=args.seed,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
@@ -810,6 +848,7 @@ def evaluate_checkpoint(args):
     Key fix vs original: total_frames truncation is NOW applied during eval
     (previously eval always used full 30 s audio regardless of total_frames).
     """
+    set_seed(getattr(args, "seed", 42))
     checkpoint_dir = args.checkpoint
     assert checkpoint_dir, "--checkpoint required for eval_only mode"
 
@@ -927,8 +966,8 @@ def evaluate_checkpoint(args):
             with torch.no_grad():
                 pred_ids = model.generate(
                     features,
-                    language="en",
-                    task="transcribe",
+                    # language="en",
+                    # task="transcribe",
                     num_beams=1,
                     max_new_tokens=256,
                 )
@@ -976,48 +1015,54 @@ def evaluate_checkpoint(args):
 def run_sweep(args):
     sizes = args.sweep_sizes.split(",")
     modes = args.sweep_modes.split(",")
-    all_results = []
+    print(sizes)
+    lora_ranks = [8, 16, 64] if getattr(args, "lora_rank_sweep", False) else [args.lora_r]
 
+    all_results = []
     for size in sizes:
         for mode in modes:
-            print(f"\n{'#'*60}\n  SWEEP: whisper-{size} | mode={mode}\n{'#'*60}")
-            args.model_size = size
-            args.mode       = mode
+            for rank in lora_ranks:          # <-- NEW loop
+                if mode == "full" and rank != args.lora_r:
+                    continue                  # rank irrelevant for full FT
+                print(f"\n{'#'*60}\n  SWEEP: whisper-{size} | mode={mode} | r={rank}\n{'#'*60}")
+                args.model_size = size
+                args.mode       = mode
+                args.lora_r     = rank 
 
-            checkpoint_dir = train(args)
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+                checkpoint_dir = train(args)
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
 
-            eval_summary = evaluate_checkpoint(
-                argparse.Namespace(
-                    model_size=size,
-                    mode=mode,
-                    checkpoint=checkpoint_dir,
-                    benchmark_dataset=getattr(args, "benchmark_dataset", "librispeech"),
-                    max_eval_samples=getattr(args, "max_eval_samples", None),
-                    fp16=getattr(args, "fp16", True),
-                    # tokens_per_frame / total_frames loaded from experiment_cfg.json
-                    tokens_per_frame=None,
-                    total_frames=None,
+                eval_summary = evaluate_checkpoint(
+                    argparse.Namespace(
+                        model_size=size,
+                        mode=mode,
+                        checkpoint=checkpoint_dir,
+                        benchmark_dataset=getattr(args, "benchmark_dataset", "librispeech"),
+                        max_eval_samples=getattr(args, "max_eval_samples", None),
+                        fp16=getattr(args, "fp16", True),
+                        # tokens_per_frame / total_frames loaded from experiment_cfg.json
+                        tokens_per_frame=None,
+                        total_frames=None,
+                    )
                 )
-            )
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            meta_path = os.path.join(checkpoint_dir, "run_meta.json")
-            with open(meta_path) as f:
-                meta = json.load(f)
+                meta_path = os.path.join(checkpoint_dir, "run_meta.json")
+                with open(meta_path) as f:
+                    meta = json.load(f)
 
-            all_results.append({**meta, **eval_summary["results"]})
+                all_results.append({**meta, **eval_summary["results"]})
 
-            sweep_path = os.path.join(args.output_dir, "sweep_results.json")
-            with open(sweep_path, "w") as f:
-                json.dump(all_results, f, indent=2)
-            print(f"Sweep results saved to {sweep_path}")
+                sweep_path = os.path.join(args.output_dir, "sweep_results.json")
+                with open(sweep_path, "w") as f:
+                    json.dump(all_results, f, indent=2)
+                print(f"Sweep results saved to {sweep_path}")
 
     print("\n" + "=" * 60 + "\nSWEEP COMPLETE\n" + "=" * 60)
     for r in all_results:
@@ -1045,6 +1090,7 @@ def parse_args(argv=None):
     p.add_argument("--total_frames",      type=int, default=1500,
                    help="xT axis: clip audio to (total_frames/1500)*30s before encoding. "
                         "1500=30s full, 750=15s, 375=7.5s")
+    p.add_argument("--seed", type=int, default=42)
 
     # Model
     p.add_argument("--model_size", type=str, default="small", choices=list(WHISPER_SIZES.keys()))
@@ -1060,7 +1106,11 @@ def parse_args(argv=None):
     p.add_argument("--max_eval_samples",  type=int,  default=None)
 
     # LoRA
-    p.add_argument("--lora_r",       type=int,   default=32)
+    p.add_argument("--lora_r",       type=int,  default=32,
+               choices=[8, 16, 32, 64],
+               help="LoRA rank. Sweep over {8,16,32,64} for xN axis analysis.")
+    p.add_argument("--lora_rank_sweep", action="store_true",
+               help="If set, run_sweep will iterate over all lora_r values.")
     p.add_argument("--lora_alpha",   type=int,   default=64)
     p.add_argument("--lora_dropout", type=float, default=0.05)
 
@@ -1077,7 +1127,7 @@ def parse_args(argv=None):
     p.add_argument("--fp16",            action="store_true", default=True)
 
     # Output
-    p.add_argument("--output_dir", type=str, default="/home/vyomwal5/SAME/checkpoints")
+    p.add_argument("--output_dir", type=str, default="/nfshomes/vyomwal5/SAME/checkpoints")
 
     # Eval only
     p.add_argument("--eval_only",  action="store_true")

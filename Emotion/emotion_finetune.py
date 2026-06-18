@@ -1,6 +1,6 @@
 import os
 
-BASE = "/scratch/zt1/project/msml604/user/mokshdag/miniconda3/envs/same"
+BASE = "/fs/nexus-scratch/vyomwal5/anaconda3/envs/whisper"
 _lib_paths = [
     f"{BASE}/lib/python3.11/site-packages/nvidia/nccl/lib",
     f"{BASE}/lib",
@@ -12,8 +12,8 @@ _lib_paths = [
 existing = os.environ.get("LD_LIBRARY_PATH", "")
 os.environ["LD_LIBRARY_PATH"] = ":".join(_lib_paths) + (":" + existing if existing else "")
 
-CACHE_DIR = "/scratch/zt1/project/msml604/user/mokshdag/hf_cache"
-
+CACHE_DIR = "/fs/nexus-scratch/vyomwal5/anaconda3/envs/whisper/hf_cache"
+ 
 os.environ["HF_HOME"]                = CACHE_DIR
 os.environ["HF_DATASETS_CACHE"]      = f"{CACHE_DIR}/datasets"
 os.environ["TRANSFORMERS_CACHE"]     = f"{CACHE_DIR}/models"
@@ -302,7 +302,8 @@ def build_model_lora(model_name, num_labels, label_names,
 def train(args):
     benchmark   = getattr(args, "benchmark_dataset", "cremad")
     bench_info  = BENCHMARK_REGISTRY[benchmark]
-    model_name  = LOCAL_MODEL_PATH.get(args.model_name, args.model_name)
+    # model_name  = LOCAL_MODEL_PATH.get(args.model_name, args.model_name)
+    model_name  = args.model_name
 
     train_split   = getattr(args, "train_split", None) or bench_info["default_train"]
     eval_split    = getattr(args, "eval_split",  None) or bench_info["default_eval"]
@@ -490,7 +491,8 @@ def evaluate_checkpoint(args):
     assert checkpoint_dir, "--checkpoint required for eval_only mode"
 
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_name  = LOCAL_MODEL_PATH.get(args.model_name, args.model_name)
+    # model_name  = LOCAL_MODEL_PATH.get(args.model_name, args.model_name)
+    model_name  = args.model_name
     benchmark   = getattr(args, "benchmark_dataset", "cremad")
     bench_info  = BENCHMARK_REGISTRY[benchmark]
     num_labels  = bench_info["num_labels"]
@@ -658,7 +660,7 @@ def parse_args(argv=None):
     p.add_argument("--fp16",            action="store_true", default=True)
 
     p.add_argument("--output_dir", type=str,
-                   default="/home/mokshdag/checkpoints/emotion_finetune")
+                   default="/nfshomes/vyomwal5/SAME/Emotion/checkpoints/")
 
     p.add_argument("--eval_only",  action="store_true")
     p.add_argument("--checkpoint", type=str, default=None)
