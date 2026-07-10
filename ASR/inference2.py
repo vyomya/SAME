@@ -1,5 +1,5 @@
 """
-inference.py — Comprehensive Inference Evaluation for Whisper ASR
+inference.py — Inference Evaluation for Whisper ASR
 =======================================================================
 Compatible with whisper_finetune.py — handles:
   - Plain WhisperForConditionalGeneration  (mode=baseline / mode=full)
@@ -7,54 +7,53 @@ Compatible with whisper_finetune.py — handles:
   - experiment_cfg.json auto-read from checkpoint directory
   - GPU-agnostic loading (A100 / V100 / H100 / CPU)
 
-Three-stage pipeline (see whisper_finetune.py for Stage 1 & 2):
-  Stage 1 — Dense sweep       : xN × xT × xV; outputs checkpoints
-  Stage 2 — Sparse + QAT      : xP (N:M sparsity) + xQ (QAT) during training
-  Stage 3 — PTQ               : THIS FILE applies post-training quantization
-                                to Stage-1 or Stage-2 checkpoints for
-                                inference-time evaluation.
+This file is read-only / inference-only. Checkpoints are evaluated exactly
+as they were produced by whisper_finetune.py:
+  - Sparsity (xP, N:M) is already baked into the checkpoint's weight values
+    from training. It is NOT re-applied, re-masked, or re-derived here —
+    doing so would risk producing a different mask than the one the model
+    was actually trained with. sparsity_pattern is only read from
+    experiment_cfg.json and logged as metadata.
+  - QAT (xQ) is a training-time technique (whisper_finetune.py --qat_mode).
+    The saved checkpoint weights already reflect QAT training; there are
+    no fake-quant modules left on a freshly-loaded model, so nothing needs
+    to be stripped or converted here. qat_mode is read from
+    experiment_cfg.json and logged as metadata, and the checkpoint is
+    loaded and run exactly as saved — i.e. this evaluates the model on
+    the quantization (QAT) it was actually trained on.
+  - There is no post-training quantization (PTQ) step in this file. Models
+    are evaluated at the precision they are loaded in (fp16 or fp32).
 
-Axes evaluated here (inference-time, read-only):
+Axes evaluated here (inference-time, read-only, informational unless noted):
   xN → model_size (Whisper tiny/small/medium/large-v3/distil-*)
-  xT → total_frames (750 or 1500 mel frames)
-  xV → tokens_per_frame (encoder output stride 1 or 2)
-  xP → sparsity_pattern (dense / 2:4 / 1:4) — baked into checkpoint weights;
-       logged from experiment_cfg.json, NOT re-applied here.
-       2:4 sparsity gives 2× effective FLOP reduction on Ampere Tensor Cores;
-       accounted for in the estimate_flops() function.
+  xT → total_frames (mel frames used)
+  xV → tokens_per_frame (encoder output stride)
+  xP → sparsity_pattern (dense / 2:4 / 1:4) — metadata only, read from
+       experiment_cfg.json, baked into checkpoint weights, NOT re-applied.
   xR → lora_r — logged from checkpoint, not re-applied (weights already merged)
-  xQ (PTQ) → quantization : fp16 / int8 / int4  ← Stage 3, applied here
-       Note: xQ (QAT) is a Stage 2 training concern (whisper_finetune.py).
-             PTQ and QAT results are logged separately in JSON output.
+  xQ → qat_mode (none / int8 / int4) — metadata only, read from
+       experiment_cfg.json. This is the quantization the checkpoint was
+       actually trained on; the checkpoint is evaluated as-saved.
 
-Quantization axis (xQ, PTQ) — post-training, applied after loading:
-  fp16  → model in fp16 (or fp32 model cast to fp16)
-  int8  → torch.quantization.quantize_dynamic (CPU-friendly, no retraining)
-  int4  → bitsandbytes NF4 (GPU only, requires bitsandbytes>=0.41)
-
-  Pipeline:
-    FP16-trained model  → evaluate as-is (fp16)
-                        → cast .float() → quantize to int8 / int4
-
-    FP32-trained model  → evaluate as-is (fp32)
-                        → cast .half() → evaluate as fp16
-                        → cast .float() → quantize to int8 / int4
+A single run can evaluate multiple checkpoints (e.g. the same base config
+trained with qat_mode=none / int8 / int4, or several sparsity patterns) by
+either pointing --checkpoint_root at a directory of checkpoints, or by
+passing a comma-separated list of paths to --checkpoint.
 
 Computes and logs:
-  - WER  (test_other)
+  - WER
   - Real-Time Factor (RTF)
-  - Theoretical inference FLOPs (precision-scaled, sparsity-scaled)
+  - Theoretical inference FLOPs (precision-scaled)
   - Measured latency per sample (mean, p50, p95, p99) via CUDA events
-  - Model size on disk (MB), peak GPU RAM (MB)
+  - Model size in memory (MB), peak GPU RAM (MB)
   - GPU name, VRAM usage, compute capability
   - Throughput (samples/sec, audio-hours/hour)
   - Model parameter counts (total, encoder, decoder)
-  - Sparsity pattern and effective sparsity FLOP scaling
-  - QAT mode from training (Stage 2) vs PTQ mode (Stage 3)
+  - sparsity_pattern and qat_mode read from training, logged as metadata
   - TensorBoard scalars + HParam panel
 
 Output:
-  - Per-run JSON  → {output_dir}/eval_{size}_{mode}_{quant}_{xP}_{bench}.json
+  - Per-run JSON  → {output_dir}/eval_{size}_{mode}_xP{xp}_xQ{qat}_{bench}.json
   - TensorBoard   → {output_dir}/tensorboard/{model_size}/{mode}/
   - Combined JSON → {output_dir}/sweep_{bench}_{timestamp}.json  (multi-run)
 
@@ -62,48 +61,29 @@ References
 ----------
   Radford et al. (2023), Whisper
   Hu et al. (2022), LoRA
-  Wang et al. (2025), Inference compute-optimal VLMs
-  Gandhi et al. (2024), Distil-Whisper
   Panayotov et al. (2015), LibriSpeech
-  Ding et al. (2024), USM-Lite, ICASSP 2024
-  NVIDIA (2020), Automatic Sparsity (ASP), 2:4 sparsity whitepaper
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USAGE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 1. Standard fp16 eval
+# 1. Standard eval of one checkpoint
 python inference_eval.py \\
     --model_size small --mode lora \\
     --checkpoint /path/to/ckpt --benchmark librispeech
 
-# 2. Sweep all PTQ levels on one checkpoint (Stage 3)
+# 2. Evaluate several checkpoints (e.g. different QAT modes) in one run
 python inference_eval.py \\
     --model_size small --mode lora \\
+    --checkpoint /path/to/ckpt_qat_none,/path/to/ckpt_qat_int8,/path/to/ckpt_qat_int4
+
+# 3. Auto-discover every checkpoint under a directory and evaluate all of them
+python inference_eval.py --checkpoint_root /home/vyomwal5/SAME/checkpoints --benchmark librispeech
+
+# 4. Sweep the xV axis (encoder token stride) on one checkpoint
+python inference_eval.py \\
+    --model_size large-v3 --mode lora \\
     --checkpoint /path/to/ckpt \\
-    --sweep_quantization fp16,int8,int4
-
-# 3. Evaluate a 2:4-sparse checkpoint (xP baked in weights) at int8 PTQ
-python inference_eval.py \\
-    --model_size large-v3 --mode lora \\
-    --checkpoint /path/to/ckpt_2_4_sparse \\
-    --quantization int8
-
-# 4. Sweep PTQ levels on sparse checkpoint
-python inference_eval.py \\
-    --model_size large-v3 --mode lora \\
-    --checkpoint /path/to/ckpt_2_4_sparse \\
-    --sweep_quantization fp16,int8,int4
-
-# 5. Auto-discover all checkpoints, evaluate each at int8
-python inference_eval.py \\
-    --checkpoint_root /home/vyomwal5/SAME/checkpoints \\
-    --quantization int8 --benchmark librispeech
-
-# 6. FP32 model: auto-cascade to fp16 + int8 + int4
-python inference_eval.py \\
-    --model_size medium --mode full \\
-    --checkpoint /path/to/fp32_ckpt \\
-    --training_dtype fp32 --sweep_quantization fp16,int8,int4
+    --sweep_tokens_per_frame 1,2,4
 
 TensorBoard:
   tensorboard --logdir /home/vyomwal5/SAME/eval_results/tensorboard
@@ -199,7 +179,7 @@ WHISPER_D_MODEL = {
 WHISPER_LAYERS = {
     "tiny":          (4,  4),  "base":          (6,  6),
     "small":         (12, 12), "medium":         (24, 24),
-    "large-v3":      (32, 32), "distil-small":   (12,  2),
+    "large-v3":      (32, 32), "distil-small":   (12,  4),
     "distil-medium": (24,  2), "distil-large":   (32,  2),
 }
 
@@ -238,15 +218,15 @@ VALID_SPARSITY_PATTERNS  = ["dense", "2:4", "1:4"]
 
 # Checkpoint folder name pattern produced by whisper_finetune.py
 CHECKPOINT_NAME_RE = re.compile(
-    r"^whisper-(?P<size>tiny|base|small|medium|large-v3)"
+    r"^whisper-(?P<size>tiny|base|small|medium|large-v3|distil-small|distil-medium|distil-large)"
     r"-(?P<mode>lora|full)"
-    r"-(?P<lorar>8|16|32|64)"
+    r"-(?P<lorar>\d+)"                    # any integer rank (8/16/32/64/0)
     r"-librispeech-asr"
     r"-tpf(?P<tpf>\d+)"
     r"-tf(?P<frames>\d+)"
-    r"(?:-xP(?P<xp>[a-zA-Z0-9:]+))?"
+    r"(?:-xP(?P<xp>[a-zA-Z0-9]+))?"      # no colon — folder stores "14" not "1:4"
     r"(?:-xQ(?P<xq>[a-zA-Z0-9]+))?"
-    r"(?:-(?P<gpu>[a-zA-Z0-9]+))?$"
+    r"(?:-(?P<gpu>[a-zA-Z0-9\-]+))?$"    # allow hyphens in gpu tag
 )
 
 
@@ -355,9 +335,18 @@ def apply_quantization(
     elif quantization == "int8":
         print("  [xQ-PTQ] Converting to fp32 for INT8 quantize_dynamic ...")
         fp32_model = inner_model.float().cpu()
-        print("  [xQ-PTQ] Applying INT8 dynamic quantization ...")
+        print("  [xQ-PTQ] Applying INT8 dynamic quantization "
+              "(excluding tied vocab head proj_out) ...")
+        # Name-based qconfig_spec so the weight-tied vocab projection stays
+        # full precision — quantizing it collapses logits (same reason
+        # finetune.apply_qat excludes it).
+        _qspec = {
+            name: torch.quantization.default_dynamic_qconfig
+            for name, mod in fp32_model.named_modules()
+            if isinstance(mod, torch.nn.Linear) and not name.endswith("proj_out")
+        }
         quantized = torch.quantization.quantize_dynamic(
-            fp32_model, {torch.nn.Linear}, dtype=torch.qint8,
+            fp32_model, qconfig_spec=_qspec, dtype=torch.qint8,
         )
         print("  [xQ-PTQ] INT8 complete. Model runs on CPU.")
         device = torch.device("cpu")
@@ -382,28 +371,29 @@ def apply_quantization(
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
-        base_path = LOCAL_PATH[model_size]
-        quantized = WhisperForConditionalGeneration.from_pretrained(
-            base_path, quantization_config=bnb_config,
-            device_map="auto", low_cpu_mem_usage=True,
-        )
+        # ── FIX: quantize the FINE-TUNED (merged) weights directly. ──────────
+        # The old "overlay" approach loaded the PRETRAINED base in NF4 and
+        # then tried state_dict().copy_() from the fine-tuned model. But
+        # bnb Linear4bit stores weights as packed uint8 Params4bit whose
+        # shapes never match the fp weights, so every quantized Linear was
+        # silently skipped — only embeddings/layernorms/convs were copied.
+        # The resulting model was the pretrained base wearing fine-tuned
+        # embeddings: a Frankenstein with ~90-100% WER. Instead, serialize
+        # the merged fine-tuned model and let bnb quantize it on load.
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="int4_ptq_") as tmpdir:
+            print(f"  [xQ-PTQ] Serializing merged fine-tuned model to {tmpdir} ...")
+            # Serialize in fp32/fp16 as-is; save_pretrained handles tied weights.
+            inner_model.cpu().save_pretrained(tmpdir, safe_serialization=True)
+            print("  [xQ-PTQ] Reloading with NF4 quantization ...")
+            quantized = WhisperForConditionalGeneration.from_pretrained(
+                tmpdir, quantization_config=bnb_config,
+                device_map="auto", low_cpu_mem_usage=True,
+            )
         quantized.config.forced_decoder_ids         = None
         quantized.generation_config.suppress_tokens = []
         quantized.config.use_cache                  = True
-
-        print("  [xQ-PTQ] Overlaying finetuned weights onto INT4 base ...")
-        ft_state    = inner_model.state_dict()
-        quant_state = quantized.state_dict()
-        copied = 0
-        for key in ft_state:
-            if key in quant_state and ft_state[key].shape == quant_state[key].shape:
-                try:
-                    quant_state[key].copy_(ft_state[key].to(quant_state[key].dtype))
-                    copied += 1
-                except Exception:
-                    pass
-        quantized.load_state_dict(quant_state, strict=False)
-        print(f"  [xQ-PTQ] INT4 overlay complete ({copied} tensors matched).")
+        print("  [xQ-PTQ] INT4 NF4 quantization of fine-tuned weights complete.")
         device = torch.device("cuda")
 
     # ── Re-wrap ───────────────────────────────────────────────────────────────
@@ -447,6 +437,194 @@ def measure_peak_ram_mb() -> float:
             return round(psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2), 2)
         except ImportError:
             return 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QAT CLEANUP — strip fake-quant modules before inference
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _remove_fake_quant(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Remove all FakeQuantize / ObservedModule wrappers inserted during QAT
+    (finetune.py --qat_mode int8/int4).
+
+    These MUST be stripped before inference. Leaving them active causes
+    training-time quantization noise to corrupt inference activations,
+    producing WER ~100% and degenerate generation (RTF ~0.15, always
+    hits max_new_tokens instead of EOS).
+
+    Strategy:
+      1. Try torch.ao.quantization.convert() to replace FakeQuantize → Identity
+      2. Manual named_modules() walk for any remaining or custom fake-quant types
+         (_Int4FakeQuantize, _Int8FakeQuantize, etc. from finetune.py)
+    """
+    import torch.ao.quantization as tq
+
+    # Method 1: tq.convert() — works for models prepared with prepare_qat()
+    try:
+        model = tq.convert(
+            model,
+            mapping={
+                tq.FakeQuantize:              torch.nn.Identity,
+                tq.FixedQParamsFakeQuantize:  torch.nn.Identity,
+            },
+            inplace=False,
+            remove_qconfig=True,
+        )
+        print("  [QAT-clean] Fake-quant → Identity via tq.convert().")
+    except Exception as e:
+        print(f"  [QAT-clean] tq.convert() skipped ({e}) — using manual walk.")
+
+    # Method 2: manual walk for custom types from finetune.py
+    FAKE_QUANT_NAMES = {
+        "_int4fakequantize", "_int8fakequantize",
+        "int4fakequantize",  "int8fakequantize",
+        "fakequantize",      "fixedqparamsfakequantize",
+        "observedmodule",
+    }
+    replaced = 0
+    named = dict(model.named_modules())
+    for name, module in list(named.items()):
+        if type(module).__name__.lower() in FAKE_QUANT_NAMES:
+            if "." in name:
+                parent_name, child_name = name.rsplit(".", 1)
+                parent = named.get(parent_name, None)
+            else:
+                parent, child_name = model, name
+            if parent is not None:
+                try:
+                    setattr(parent, child_name, torch.nn.Identity())
+                    replaced += 1
+                except Exception:
+                    pass
+
+    if replaced:
+        print(f"  [QAT-clean] Removed {replaced} custom fake-quant module(s).")
+    else:
+        print("  [QAT-clean] No custom fake-quant modules found.")
+
+    # Remove any lingering qconfig attributes that could affect forward pass
+    for module in model.modules():
+        if hasattr(module, "qconfig"):
+            module.qconfig = None
+
+    return model
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPARSITY MASK REAPPLICATION — re-derive N:M mask from loaded weights
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prune_base_nm(model: torch.nn.Module, sparsity_pattern: str) -> torch.nn.Module:
+    """
+    Reconstruct the sparse base a post-training-pruned LoRA adapter was
+    trained against, BEFORE the adapter is attached/merged.
+
+    Mirrors finetune.apply_nm_sparsity_oneshot exactly (mask-only, no
+    hardware sparse conversion): all eligible nn.Linear layers — encoder
+    AND decoder, attention AND fc1/fc2 — excluding the tied vocab output
+    head. Deterministic given the base weights, so re-running it on a
+    freshly loaded pretrained base reproduces the identical structure.
+
+    This replaces the old (wrong) flow of merging the adapter onto a DENSE
+    base and then re-masking the MERGED weights, which (a) merged against
+    a base the adapter never saw, and (b) derived a different mask from
+    base+delta magnitudes, zeroing weight mass that was never zero in
+    training — catastrophic at 1:4.
+    """
+    if sparsity_pattern == "dense":
+        return model
+    n, m = (int(x) for x in sparsity_pattern.split(":"))
+    print(f"  [xP] Pre-merge: applying {sparsity_pattern} magnitude mask to "
+          f"fresh base (matches finetune.apply_nm_sparsity_oneshot)...")
+
+    output_head = None
+    if hasattr(model, "get_output_embeddings"):
+        try:
+            output_head = model.get_output_embeddings()
+        except Exception:
+            output_head = None
+
+    pruned = 0
+    with torch.no_grad():
+        for name, module in model.named_modules():
+            if not isinstance(module, torch.nn.Linear) or "lora_" in name:
+                continue
+            if module is output_head or name.endswith("proj_out"):
+                continue
+            w = module.weight.data
+            rows, cols = w.shape
+            if rows < m or cols < m or rows % m != 0 or cols % m != 0:
+                continue
+            w_blocks = w.reshape(-1, m)
+            _, sorted_idx = torch.sort(w_blocks.abs(), dim=1)
+            zero_idx = sorted_idx[:, : m - n]
+            mask = torch.ones_like(w_blocks, dtype=torch.bool)
+            mask.scatter_(1, zero_idx, False)
+            module.weight.data = (w_blocks * mask.to(w.dtype)).reshape(w.shape)
+            pruned += 1
+    print(f"  [xP] Pre-merge mask applied to {pruned} Linear layer(s).")
+    return model
+
+
+def _reapply_nm_sparsity(
+    model:            torch.nn.Module,
+    sparsity_pattern: str,
+) -> torch.nn.Module:
+    """
+    After loading a checkpoint trained with N:M sparsity, the zero pattern
+    is stored in the weight values but the sparse mask metadata is NOT in
+    the checkpoint (it lives in the training-time pruner object).
+
+    This re-derives the mask from the existing zero pattern and re-enforces
+    it so that:
+      1. The zero pattern cannot be corrupted by any downstream ops
+      2. The weights are correctly zeroed (guards against any fp16 load drift)
+
+    Only applied to encoder attention projections (q/k/v/out_proj) since
+    that is where finetune.py applies N:M sparsity.
+
+    sparsity_pattern: "dense" | "2:4" | "1:4"
+    """
+    if sparsity_pattern == "dense":
+        return model
+
+    try:
+        n_str, m_str = sparsity_pattern.split(":")
+        N, M = int(n_str), int(m_str)
+    except (ValueError, AttributeError):
+        print(f"  [xP] Cannot parse sparsity pattern '{sparsity_pattern}' — skipping.")
+        return model
+
+    print(f"  [xP] Re-enforcing {sparsity_pattern} mask from loaded weight values...")
+
+    inner         = model.model if isinstance(model, WhisperWithTokenSubsampling) else model
+    whisper_model = getattr(inner, "model", inner)
+    encoder       = getattr(whisper_model, "encoder", None)
+    if encoder is None:
+        print("  [xP] Could not locate encoder — skipping mask reapplication.")
+        return model
+
+    remasked = 0
+    with torch.no_grad():
+        for layer in encoder.layers:
+            for proj_name in ("q_proj", "k_proj", "v_proj", "out_proj"):
+                proj = getattr(layer.self_attn, proj_name, None)
+                if proj is None or not hasattr(proj, "weight"):
+                    continue
+                W = proj.weight.data
+                orig_shape = W.shape
+                # Flatten to (-1, M) groups, keep top-N per group by magnitude
+                W_flat    = W.reshape(-1, M)
+                mask_flat = torch.zeros_like(W_flat, dtype=torch.bool)
+                topn_idx  = W_flat.abs().topk(N, dim=1).indices
+                mask_flat.scatter_(1, topn_idx, True)
+                mask = mask_flat.reshape(orig_shape)
+                proj.weight.data = W * mask.to(W.dtype)
+                remasked += 1
+
+    print(f"  [xP] Re-masked {remasked} projection(s) with {sparsity_pattern} pattern.")
+    return model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -507,7 +685,12 @@ def discover_checkpoints(
         lorar = int(m.group("lorar"))
         tpf   = int(m.group("tpf"))
         tf    = int(m.group("frames"))
-        xp    = (m.group("xp") or "dense").replace("", ":")  # restore colon
+        # Restore colon: folder stores "14"/"24" → restore to "1:4"/"2:4"
+        _xp_raw = m.group("xp") or "dense"
+        if re.match(r"^\d\d$", _xp_raw):          # "14" → "1:4", "24" → "2:4"
+            xp = f"{_xp_raw[0]}:{_xp_raw[1]}"
+        else:
+            xp = _xp_raw                           # "dense" stays "dense"
         xq    = m.group("xq") or "none"
         gpu   = m.group("gpu") or "unknown"
 
@@ -594,14 +777,34 @@ def load_model_for_inference(
     device:           torch.device,
     tokens_per_frame: int  = 1,
     fp16:             bool = True,
+    saved_cfg:        Optional[Dict] = None,
 ) -> Tuple[torch.nn.Module, WhisperProcessor]:
     """
     Load base model + LoRA merge (if applicable) to CPU, then move to device.
+
+    Post-load steps (new):
+      1. Strip fake-quant modules if checkpoint was QAT-trained
+         (qat_mode != "none" in experiment_cfg.json). Fake-quant left active
+         at inference causes WER ~100% and RTF ~0.15 (never hits EOS).
+      2. Re-enforce N:M sparsity mask from weight zero-pattern if xP != dense.
+         The mask is not saved in the checkpoint; re-deriving it from the
+         loaded weight values prevents any fp16-load drift from corrupting
+         the zero pattern.
+
     PTQ quantization is applied AFTER this function via apply_quantization().
-    N:M sparsity is already baked into the saved checkpoint weights.
+    No PTQ is applied here — this function loads at training precision only.
     """
+    saved_cfg  = saved_cfg or {}
     model_name = LOCAL_PATH[model_size]
-    dtype      = torch.float16 if fp16 else torch.float32
+    is_distil  = model_size.startswith("distil-")
+
+    # Distil-Whisper: load FP32 then cast to FP16 post-load to avoid
+    # tied-weight (proj_out / embed_tokens) dtype assertion on small decoder.
+    if is_distil and fp16:
+        dtype = torch.float32   # will cast to fp16 after load
+        print(f"  [dtype] Distil model — loading FP32, casting to FP16 after load.")
+    else:
+        dtype = torch.float16 if fp16 else torch.float32
 
     _base_cfg_path = os.path.join(model_name, "config.json")
     _num_mel_bins  = 80
@@ -645,10 +848,19 @@ def load_model_for_inference(
         model = base
     elif mode == "lora":
         assert checkpoint, "--checkpoint required for mode=lora"
+        # ── ORDER MATTERS: prune the base BEFORE attaching/merging the
+        # adapter. For post-training-pruned LoRA checkpoints, only the
+        # adapter is saved; the sparse base must be reconstructed here
+        # exactly as it was during recovery training (see _prune_base_nm).
+        _sp = (saved_cfg or {}).get("sparsity_pattern", "dense")
+        if _sp != "dense":
+            base = _prune_base_nm(base, _sp)
         print(f"  Applying LoRA from: {checkpoint}")
         peft_model = PeftModel.from_pretrained(base, checkpoint, is_trainable=False)
         model      = peft_model.merge_and_unload()
-        print("  LoRA merged into base weights.")
+        print("  LoRA merged into base weights."
+              + ("  (sparse base + dense LoRA delta — merged weights are "
+                 "intentionally NOT strictly N:M)" if _sp != "dense" else ""))
     elif mode == "full":
         assert checkpoint, "--checkpoint required for mode=full"
         model = WhisperForConditionalGeneration.from_pretrained(
@@ -660,6 +872,32 @@ def load_model_for_inference(
     else:
         raise ValueError(f"Unknown mode '{mode}'.")
 
+    # ── Distil-Whisper FP16 cast (after weight tying is resolved) ────────────
+    if is_distil and fp16:
+        model = model.half()
+        print("  [dtype] Cast to FP16 post-load.")
+
+    # ── Strip fake-quant modules (QAT checkpoints) ───────────────────────────
+    # Must happen BEFORE move to device so Identity replacements are clean.
+    qat_mode = saved_cfg.get("qat_mode", "none")
+    if qat_mode != "none":
+        print(f"  [QAT-clean] Checkpoint trained with qat_mode={qat_mode} — "
+              f"stripping fake-quant modules before inference.")
+        model = _remove_fake_quant(model)
+
+    # ── Re-enforce N:M sparsity mask (FULL-finetune checkpoints only) ────────
+    # For mode=full the sparse weights ARE saved in the checkpoint, so
+    # re-deriving the mask from the loaded values just guards against
+    # fp16-load drift. For mode=lora this step is now handled correctly
+    # BEFORE the merge (see above) — re-masking merged base+LoRA weights
+    # here would corrupt the model (wrong mask, deletes trained delta).
+    sparsity_pattern = saved_cfg.get("sparsity_pattern", "dense")
+    if sparsity_pattern != "dense" and mode == "full":
+        print(f"  [xP] Full-finetune checkpoint with sparsity={sparsity_pattern} — "
+              f"re-enforcing mask from loaded weight values.")
+        model = _reapply_nm_sparsity(model, sparsity_pattern)
+
+    # ── Subsampling wrapper ───────────────────────────────────────────────────
     if tokens_per_frame > 1:
         model = WhisperWithTokenSubsampling(model, tokens_per_frame)
         print(f"  [xV] Subsampling: stride={tokens_per_frame} "
@@ -840,7 +1078,8 @@ def evaluate_split(
 
     if use_cuda:
         torch.cuda.reset_peak_memory_stats()
-
+    inner = model.model if isinstance(model, WhisperWithTokenSubsampling) else model
+    is_multilingual = getattr(inner.config, "is_multilingual", False)
     _mel_bins    = getattr(processor.feature_extractor, "feature_size", 80)
     dummy_dtype  = torch.float32 if quantization == "int8" \
                    else torch.float16 if fp16 else torch.float32
@@ -853,6 +1092,14 @@ def evaluate_split(
             model.generate(dummy, max_new_tokens=8, num_beams=1)
     if use_cuda:
         torch.cuda.synchronize()
+
+    # ── Build generate kwargs — guard distil English-only models ─────────────
+    # Distil-Whisper .en variants (distil-small, distil-medium) have
+    # is_multilingual=False and raise ValueError if language/task are passed.
+    gen_kwargs: Dict = {"num_beams": num_beams, "max_new_tokens": max_new_tokens}
+    if is_multilingual:
+        gen_kwargs["language"] = "en"
+        gen_kwargs["task"]     = "transcribe"
 
     print("  Running inference...")
     for sample in tqdm.tqdm(dataset):
@@ -871,23 +1118,20 @@ def evaluate_split(
             ev1 = torch.cuda.Event(enable_timing=True)
             ev0.record()
             with torch.no_grad():
-                pred_ids = model.generate(
-                    features, language="en", task="transcribe",
-                    num_beams=num_beams, max_new_tokens=max_new_tokens,
-                )
+                pred_ids = model.generate(features, **gen_kwargs)
             ev1.record()
             torch.cuda.synchronize()
             lat_ms = ev0.elapsed_time(ev1)
         else:
             t0 = time.perf_counter()
             with torch.no_grad():
-                pred_ids = model.generate(
-                    features, language="en", task="transcribe",
-                    num_beams=num_beams, max_new_tokens=max_new_tokens,
-                )
+                pred_ids = model.generate(features, **gen_kwargs)
             lat_ms = (time.perf_counter() - t0) * 1000.0
 
-        pred_text = processor.tokenizer.decode(pred_ids[0], skip_special_tokens=True)
+        # Guard against tokenizer OverflowError from out-of-range IDs
+        # (can occur with QAT/sparse models in early convergence)
+        raw_ids = pred_ids[0].clamp(min=0, max=processor.tokenizer.vocab_size - 1)
+        pred_text = processor.tokenizer.decode(raw_ids, skip_special_tokens=True)
         all_preds.append(normalize_text(pred_text))
         all_refs.append(normalize_text(ref_text))
         latencies_ms.append(lat_ms)
@@ -1044,29 +1288,29 @@ def run_evaluation(
     fp16:             bool,
     num_beams:        int,
     output_dir:       str,
-    quantization:     str   = "fp16",      # PTQ (Stage 3)
-    sparsity_pattern: str   = "dense",     # xP (read from checkpoint, not applied)
-    qat_mode:         str   = "none",      # xQ train (Stage 2, from checkpoint)
-    training_dtype:   str   = "fp16",
+    sparsity_pattern: str   = "dense",     # xP — read from checkpoint cfg
+    qat_mode:         str   = "none",      # xQ (train, Stage 2) — read from checkpoint cfg
     gpu_tag:          str   = "unknown",
     tb_manager:       Optional[TBWriterManager] = None,
 ) -> Dict:
     """
-    Full Stage 3 evaluation pipeline:
+    Evaluation pipeline — no PTQ applied.
+    Evaluates each checkpoint at its training precision.
+
       1. Load model (base + LoRA merge if applicable)
-         N:M sparsity is already in the weights — no re-application.
-      2. Apply PTQ quantization (xQ, Stage 3)
-      3. Measure model size
-      4. Run inference on eval splits
-      5. Compute FLOPs (precision-scaled AND sparsity-scaled)
-      6. Save JSON + TensorBoard
+      2. Strip fake-quant modules if qat_mode != none (done inside loader)
+      3. Re-enforce N:M sparsity mask if xP != dense (done inside loader)
+      4. Measure model size
+      5. Run inference on eval splits
+      6. Compute FLOPs (sparsity-scaled, fp16 precision)
+      7. Save JSON + TensorBoard
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"\n{'='*72}")
     print(f"  whisper-{model_size} | {mode} | lora_r={lorar} | "
           f"tf={total_frames} | tpf={tokens_per_frame} | "
-          f"ptq={quantization} | xP={sparsity_pattern} | "
+          f" xP={sparsity_pattern} | "
           f"xQ(train)={qat_mode} | tag={gpu_tag}")
     print(f"  Device: {device}"
           + (f" ({torch.cuda.get_device_name(device)})"
@@ -1081,23 +1325,32 @@ def run_evaluation(
     gpu_info = get_gpu_info()
     gpu_dict = asdict(gpu_info) if gpu_info else {"name": "CPU", "available": False}
 
-    # ── 1. Load ───────────────────────────────────────────────────────────────
+    # ── Read experiment_cfg once — passed into loader for QAT/xP handling ─────
+    saved_cfg = _read_experiment_cfg(checkpoint) if checkpoint else {}
+    # Allow caller overrides (from discover_checkpoints spec)
+    if sparsity_pattern != "dense":
+        saved_cfg.setdefault("sparsity_pattern", sparsity_pattern)
+    if qat_mode != "none":
+        saved_cfg.setdefault("qat_mode", qat_mode)
+
+    # ── 1. Load + clean (fake-quant removal + sparsity mask reapplication) ────
     t0 = time.time()
     model, processor = load_model_for_inference(
         model_size=model_size, mode=mode, checkpoint=checkpoint,
         device=device, tokens_per_frame=tokens_per_frame, fp16=fp16,
+        saved_cfg=saved_cfg,
     )
     load_s = round(time.time() - t0, 2)
 
-    # ── 2. PTQ Quantization (Stage 3) ─────────────────────────────────────────
-    model, device = apply_quantization(
-        model=model, quantization=quantization,
-        training_dtype=training_dtype, device=device,
-        model_size=model_size, checkpoint=checkpoint,
-    )
+    # ── 2. No PTQ applied — evaluate at training precision ────────────────────
+    # PTQ removed per project decision. xQ axis is training-time only (QAT).
+    # Fake-quant stripping and sparsity mask reapplication done in loader above.
+    quantization = "fp16"   # used only for FLOPs accounting label below
+    print(f"  [xQ] Evaluating at training precision "
+          f"(qat_mode={qat_mode}, no PTQ applied).")
 
     # ── 3. Model size measurement ─────────────────────────────────────────────
-    model_size_mb = measure_model_size_mb(model, quantization)
+    model_size_mb = measure_model_size_mb(model, "fp16")
     print(f"  Model size in memory: {model_size_mb} MB")
 
     # ── 4. Evaluate ───────────────────────────────────────────────────────────
@@ -1165,7 +1418,6 @@ def run_evaluation(
             "quantization_ptq":         quantization,
             # xQ: QAT (Stage 2, baked into checkpoint from training)
             "qat_mode_train":           qat_mode,
-            "training_dtype":           training_dtype,
             "model_size_mb":            model_size_mb,
             "bytes_per_param_theoretical": PRECISION_BYTES.get(quantization, 2),
         },
@@ -1211,7 +1463,7 @@ def print_summary(all_results: List[Dict]):
     print(f"\n{'='*W}\n  EVALUATION SUMMARY\n{'='*W}")
     print(
         f"{'Model':<14} {'Mode':<8} {'Frames':>7} {'TpF':>4} "
-        f"{'PTQ':<6} {'xP':<5} {'xQ(tr)':<7} "
+        f"{'xP':<5} {'xQ(tr)':<7} "
         f"{'WER%':>8} {'RTF':>7} "
         f"{'p50ms':>7} {'FLOPs-G':>8} {'EffFLOPs':>9} "
         f"{'SizeMB':>7} {'PeakRAM':>8} {'GPU':<20}"
@@ -1239,7 +1491,7 @@ def print_summary(all_results: List[Dict]):
         print(
             f"  {info['model_size']:<12} {info['mode']:<8} "
             f"{info['total_frames']:>7} {info['tokens_per_frame']:>4} "
-            f"{comp.get('quantization_ptq','?'):<6} {xp_str:<5} {xq_str:<7} "
+            f"{xp_str:<5} {xq_str:<7} "
             f"{_f(wer, '{:.3f}'):>8} {_f(rtf, '{:.4f}'):>7} "
             f"{_f(p50, '{:.1f}'):>7} "
             f"{flops['flops_total_G']:>8.1f} "
@@ -1250,9 +1502,9 @@ def print_summary(all_results: List[Dict]):
         )
     print("=" * W)
     print(
-        "  TpF=tokens_per_frame | PTQ=post-training quant (Stage 3) | "
-        "xP=N:M sparsity (Stage 1/2, baked in weights) | "
-        "xQ(tr)=QAT mode (Stage 2) | EffFLOPs=precision×sparsity scaled"
+        "  TpF=tokens_per_frame | xP=N:M sparsity (baked in weights from training) | "
+        "xQ(tr)=QAT mode from training | EffFLOPs=fp16×sparsity scaled | "
+        "No PTQ applied — checkpoints evaluated at training precision."
     )
 
 
@@ -1284,25 +1536,25 @@ def parse_args():
     ag.add_argument("--sweep_tokens_per_frame", type=str, default=None)
     ag.add_argument("--sweep_total_frames",     type=str, default=None)
 
-    qg = p.add_argument_group("PTQ quantization axis (xQ, Stage 3)")
-    qg.add_argument("--quantization", type=str, default="fp16",
-                    choices=VALID_QUANTIZATIONS,
-                    help=(
-                        "Stage 3 post-training quantization.\n"
-                        "  fp16 → cast to fp16 (or no-op if already fp16)\n"
-                        "  int8 → torch.quantization.quantize_dynamic (CPU)\n"
-                        "  int4 → bitsandbytes NF4 (GPU, bitsandbytes>=0.41)\n"
-                        "Note: INT8/INT4 QAT (training-time) is in finetune.py --qat_mode."
-                    ))
-    qg.add_argument("--sweep_quantization", type=str, default=None,
-                    help="Comma-separated PTQ levels, e.g. fp16,int8,int4")
-    qg.add_argument("--training_dtype", type=str, default="fp16",
+    # qg = p.add_argument_group("PTQ quantization axis (xQ, Stage 3)")
+    # qg.add_argument("--quantization", type=str, default="fp16",
+    #                 choices=VALID_QUANTIZATIONS,
+    #                 help=(
+    #                     "Stage 3 post-training quantization.\n"
+    #                     "  fp16 → cast to fp16 (or no-op if already fp16)\n"
+    #                     "  int8 → torch.quantization.quantize_dynamic (CPU)\n"
+    #                     "  int4 → bitsandbytes NF4 (GPU, bitsandbytes>=0.41)\n"
+    #                     "Note: INT8/INT4 QAT (training-time) is in finetune.py --qat_mode."
+    #                 ))
+    # qg.add_argument("--sweep_quantization", type=str, default=None,
+    #                 help="Comma-separated PTQ levels, e.g. fp16,int8,int4")
+    p.add_argument("--training_dtype", type=str, default="fp32",
                     choices=["fp16", "fp32"])
 
     p.add_argument("--benchmark",        type=str, default="librispeech",
                    choices=["librispeech", "common_voice", "fleurs"])
     p.add_argument("--max_eval_samples", type=int, default=None)
-    p.add_argument("--fp16",             action="store_true", default=True)
+    p.add_argument("--fp16",             action="store_true", default=False)
     p.add_argument("--num_beams",        type=int, default=1)
     p.add_argument("--output_dir",       type=str,
                    default="/nfshomes/vyomwal5/SAME/eval_results")
@@ -1336,9 +1588,6 @@ def main():
         print(f"  Driver / CUDA    : {gpu.driver_version} / {gpu.cuda_version}")
     else:
         print("  Running on CPU (no CUDA GPU detected)")
-        if args.quantization == "int4":
-            print("  WARNING: INT4 requires a CUDA GPU. Falling back to int8.")
-            args.quantization = "int8"
     print("="*72)
 
     tb_root    = os.path.join(args.output_dir, "tensorboard")
@@ -1348,14 +1597,8 @@ def main():
         print(f"\n  TensorBoard → {tb_root}")
         print(f"  Launch: tensorboard --logdir {tb_root}\n")
 
-    # ── Build PTQ quantization list ───────────────────────────────────────────
-    if args.sweep_quantization:
-        quant_list = [q.strip() for q in args.sweep_quantization.split(",")]
-    elif args.training_dtype == "fp32":
-        print("  [xQ-PTQ] FP32 model detected — auto-cascading: fp16,int8,int4")
-        quant_list = ["fp16", "int8", "int4"]
-    else:
-        quant_list = [args.quantization]
+    # PTQ removed — evaluate each checkpoint at its training precision only.
+    quant_list = ["fp16"]   # kept for EvalJob dataclass compat; not used for conversion
 
     # ── Build EvalJob list ────────────────────────────────────────────────────
     @dataclass
@@ -1467,10 +1710,8 @@ def main():
             fp16=args.fp16,
             num_beams=args.num_beams,
             output_dir=args.output_dir,
-            quantization=job.quantization,
             sparsity_pattern=job.sparsity_pattern,
             qat_mode=job.qat_mode,
-            training_dtype=job.training_dtype,
             gpu_tag=job.gpu_tag,
             tb_manager=tb_manager,
         )

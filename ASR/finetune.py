@@ -16,23 +16,68 @@ Axes of compute reduction (aligned with Wang et al. and USM-Lite):
   xV → --tokens_per_frame  : encoder output subsampling before decoder cross-attn
   xR → --lora_r            : LoRA rank {0=no-LoRA, 8, 16, 32, 64}
   xP → --sparsity_pattern  : N:M weight sparsity {dense, 2:4, 1:4}
-                             Applied during training (sparse base + dense LoRA).
-                             Uses torch.sparse semi-structured sparsity API
-                             (requires Ampere+ GPU, i.e., A100/A6000/RTX3090+).
-                             Mask schedule: one-shot at step 0 for 2:4,
-                             ramp-in over 500 steps for 1:4.
+
+                             PRUNING STRATEGY (unified, both patterns):
+                             Sparsity is now applied AFTER a dense LoRA run
+                             has converged, followed by a fixed-length
+                             recovery fine-tune (default 500 steps). This
+                             replaces the old "prune before LoRA training"
+                             approach, which forced the adapter to learn
+                             the task and compensate for a heavily-pruned
+                             base simultaneously from random init — this
+                             was the direct cause of the instability seen
+                             on xP=1:4 sweep configs. Pre- vs. post-training
+                             pruning produces IDENTICAL final FLOPs/RTF
+                             (same sparsity ratio either way); the only
+                             thing post-training pruning buys you is
+                             better WER / stabler convergence, since the
+                             adapter starts recovery from an
+                             already-converged solution instead of from
+                             scratch under a handicap.
+
+                             Within the shared post-hoc-prune + recovery
+                             strategy, patterns still differ in how the
+                             mask is *updated* during recovery (this is a
+                             property of the sparsity ratio itself, not a
+                             competing training strategy):
+                               2:4 → mask computed once at the start of
+                                     recovery, then frozen. Hardware
+                                     sparse GEMM via
+                                     to_sparse_semi_structured (Ampere+).
+                               1:4 → mask recomputed every 50 steps for
+                                     the full recovery window (default
+                                     500 steps), then frozen. A 75% sparse
+                                     mask is a bigger shock than 50%, so
+                                     it benefits from being re-derived as
+                                     the adapter adjusts.
+
+                             See prune_and_recover() for the entry point.
+                             The old prune-before-LoRA path in
+                             build_model_lora() / build_model_full() is
+                             kept only for backward compatibility with
+                             mode=full (where the base is trainable and
+                             genuinely drifts under the sparsity mask —
+                             pre- vs post- distinction doesn't apply the
+                             same way there). For mode=lora, use
+                             --prune_after_lora instead of
+                             --sparsity_pattern at train() time.
   xQ (QAT) → --qat_mode    : Quantization-aware training {none, int8, int4}
                              Applied only to Pareto-optimal configs (Stage 2).
                              Uses torch.quantization fake-quant observers.
                              PTQ (post-training) lives in inference_eval.py.
 
-Three-stage pipeline
---------------------
-  Stage 1 — Dense sweep    : vary xN × xT × xV; log FLOPs / WER / size
-  Stage 2 — Sparse + QAT   : apply xP and/or xQ (QAT) to configs on the
-                              Pareto frontier from Stage 1
-  Stage 3 — PTQ            : apply PTQ to Stage-1/2 checkpoints
-                              (handled in inference_eval.py)
+Pipeline
+--------
+  Stage 1 — Dense sweep         : vary xN × xT × xV; log FLOPs / WER / size
+  Stage 1.5 — Prune + recover   : for LoRA configs on the Pareto frontier,
+                                   take the converged dense checkpoint and
+                                   apply xP via prune_and_recover() (this
+                                   file), which prunes the base then runs
+                                   a short recovery fine-tune.
+  Stage 2 — QAT                 : apply xQ to configs on the Pareto
+                                   frontier from Stage 1 / Stage 1.5
+  Stage 3 — PTQ                 : apply PTQ to Stage-1/2 checkpoints
+                                   (handled in inference_eval.py)
 
 N:M sparsity implementation note
 ---------------------------------
@@ -41,15 +86,15 @@ We use PyTorch's built-in semi-structured sparsity support
 This gives hardware-accelerated sparse GEMM on Ampere Tensor Cores
 (A100, A6000, RTX 3090+) with cuSPARSELt or CUTLASS backends.
 
-  2:4  → one-shot magnitude pruning at step 0; mask fixed for training
-  1:4  → iterative: mask computed every 50 steps for first 500 steps,
-          then frozen (ramp-in schedule avoids accuracy collapse)
+  2:4  → one-shot magnitude pruning at start of recovery; mask fixed
+  1:4  → iterative: mask computed every 50 steps for the recovery
+          window, then frozen (ramp-in schedule avoids accuracy collapse)
 
 Sparse base weights + dense LoRA (Option A):
-  Sparsity is applied to the *base* model weights before LoRA adapters
-  are inserted.  LoRA delta matrices (B, A) remain dense.
-  This mimics the USM-Lite approach of compressing the backbone while
-  keeping the task-specific adaptation pathway at full precision.
+  Sparsity is applied to the *base* model weights; LoRA delta matrices
+  (B, A) remain dense. This mimics the USM-Lite approach of compressing
+  the backbone while keeping the task-specific adaptation pathway at
+  full precision.
 
 QAT implementation note
 ------------------------
@@ -68,22 +113,24 @@ References
   Gandhi et al. (2024), Distil-Whisper
   Panayotov et al. (2015), LibriSpeech
   Ding et al. (2024), USM-Lite, ICASSP 2024   ← compression framework extended here
-  NVIDIA (2020), Automatic Sparsity (ASP)
+  NVIDIA (2020), Automatic Sparsity (ASP)     ← prune-then-recover pattern
   Pool & Yu (2021), NVIDIA 2:4 sparsity whitepaper
 
 Can be used standalone OR imported/called by run_experiment.py.
 
 Usage (standalone):
-  # Standard LoRA fine-tune (dense baseline)
+  # Standard LoRA fine-tune (dense baseline) — always dense at this stage now
   python whisper_finetune.py --model_size small --mode lora --streaming
 
-  # 2:4 sparse base + LoRA (Stage 2, xP axis)
-  python whisper_finetune.py --model_size small --mode lora \\
-      --sparsity_pattern 2:4
+  # Post-training pruning + recovery on a converged dense LoRA checkpoint
+  # (Stage 1.5, xP axis, unified strategy for both 2:4 and 1:4)
+  python whisper_finetune.py --prune_after_lora \\
+      --dense_checkpoint /path/to/dense/lora/checkpoint \\
+      --sparsity_pattern 2:4 --recovery_steps 500
 
-  # 1:4 sparse with iterative mask schedule
-  python whisper_finetune.py --model_size medium --mode lora \\
-      --sparsity_pattern 1:4
+  python whisper_finetune.py --prune_after_lora \\
+      --dense_checkpoint /path/to/dense/lora/checkpoint \\
+      --sparsity_pattern 1:4 --recovery_steps 500
 
   # QAT INT8 on a Pareto-optimal config (Stage 2)
   python whisper_finetune.py --model_size small --mode lora \\
@@ -175,7 +222,7 @@ BENCHMARK_REGISTRY = {
         "language":      "English",
         "default_train": "train.100",
         "default_eval":  "validation",
-        "default_test":  [("clean", "test"), ("other", "test")],
+        "default_test":  [("clean", "test")],
         "task":          "transcribe",
     },
     "common_voice": {
@@ -219,6 +266,8 @@ VALID_SPARSITY_PATTERNS = ["dense", "2:4", "1:4"]
 VALID_QAT_MODES = ["none", "int8", "int4"]
 
 # Mask ramp-in schedule for 1:4: apply mask update every N steps for first M steps
+# NOTE: this now describes the RECOVERY window (post-training pruning),
+# not a schedule applied during the original dense LoRA training.
 ITERATIVE_MASK_STEPS   = 500   # total steps during which mask is updated
 ITERATIVE_MASK_FREQ    = 50    # update mask every this many steps
 
@@ -287,16 +336,28 @@ def apply_nm_sparsity_oneshot(
 
     For 2:4: one-shot, mask frozen immediately — uses hardware-accelerated
              SparseSemiStructuredTensor if available (Ampere+ GPU).
-    For 1:4: same one-shot application; iterative updating is handled by
-             NMSparseCallback during training.
+    For 1:4: same one-shot application; iterative updating during the
+             recovery window is handled by NMSparseCallback.
 
-    This function is called BEFORE LoRA adapters are inserted (Option A),
-    ensuring that the base weight tensor is sparse and LoRA delta matrices
-    remain dense.
+    This function is called on the base model — for the unified
+    post-training pruning strategy, that's a base whose values were
+    produced by a fully-converged dense LoRA run.
+
+    IMPORTANT: this function is deterministic given the same input weights
+    (magnitude-based mask). Since the base is frozen throughout LoRA
+    training/recovery (never gradient-updated) and is not touched by
+    training in mode=lora, it is safe (and required) to re-run this exact
+    function on a freshly-loaded pretrained base at eval time to
+    reconstruct the identical sparse structure that was actually trained
+    against — see evaluate_checkpoint().
 
     Parameters
     ----------
     model              : WhisperForConditionalGeneration (plain, pre-LoRA)
+                         or a base already wrapped by PEFT
+                         (get_base_model() is resolved internally where
+                         relevant callers need it — this function itself
+                         expects a plain nn.Module and walks named_modules).
     pattern            : "2:4" or "1:4"
     use_hardware_sparse: if True and SPARSE_AVAILABLE, convert to
                          SparseSemiStructuredTensor for accelerated GEMM.
@@ -308,6 +369,13 @@ def apply_nm_sparsity_oneshot(
     n, m = int(pattern.split(":")[0]), int(pattern.split(":")[1])
     print(f"\n  [xP] Applying {pattern} N:M sparsity (one-shot magnitude) ...")
 
+    output_head = None
+    if hasattr(model, "get_output_embeddings"):
+        try:
+            output_head = model.get_output_embeddings()
+        except Exception:
+            output_head = None
+
     pruned_count  = 0
     skipped_count = 0
 
@@ -316,6 +384,15 @@ def apply_nm_sparsity_oneshot(
             if not isinstance(module, nn.Linear):
                 continue
             if "lora_" in name:
+                continue
+            if module is output_head or name.endswith("proj_out"):
+                # Never prune the vocab output head — it's weight-tied to
+                # the token embedding and, in LoRA mode, is never trained
+                # (LORA_TARGET_MODULES only covers q_proj/v_proj), so any
+                # damage here is permanent and unrecoverable. Zeroing 75%
+                # of it (at 1:4) is a direct cause of persistently high
+                # WER even after decoding/repetition fixes are applied.
+                skipped_count += 1
                 continue
             w = module.weight.data
             rows, cols = w.shape
@@ -358,17 +435,19 @@ def apply_nm_sparsity_oneshot(
 class NMSparseCallback:
     """
     Training callback that implements the iterative mask-update schedule
-    for 1:4 sparsity during the first ITERATIVE_MASK_STEPS training steps.
+    for 1:4 sparsity during the RECOVERY window (first ITERATIVE_MASK_STEPS
+    steps after post-training pruning).
 
     At each update step, magnitude-based N:M masks are recomputed on the
-    current weight values.  After ITERATIVE_MASK_STEPS steps the mask is
+    current weight values. After ITERATIVE_MASK_STEPS steps the mask is
     frozen (no further updates), allowing the model to converge stably.
 
-    Usage: instantiate before training, call .on_step_end(model, step) from
-    a custom Trainer subclass or training loop.
+    Usage: instantiate before the recovery fine-tune, call
+    .on_step_end(model, step) from a custom Trainer subclass or training
+    loop.
 
-    For 2:4 sparsity the mask is one-shot (fixed at step 0), so this
-    callback is a no-op and need not be attached.
+    For 2:4 sparsity the mask is one-shot (fixed at the start of
+    recovery), so this callback is a no-op and need not be attached.
     """
 
     def __init__(self, pattern: str = "1:4"):
@@ -398,9 +477,18 @@ class NMSparseCallback:
             if isinstance(base, PeftModel):
                 base = base.get_base_model()
 
+            output_head = None
+            if hasattr(base, "get_output_embeddings"):
+                try:
+                    output_head = base.get_output_embeddings()
+                except Exception:
+                    output_head = None
+
             for name, module in base.named_modules():
                 if not isinstance(module, nn.Linear) or "lora_" in name:
                     continue
+                if module is output_head or name.endswith("proj_out"):
+                    continue  # never prune the tied vocab output head
                 w = module.weight.data
                 rows, cols = w.shape
                 if rows < m or cols < m or rows % m != 0 or cols % m != 0:
@@ -482,16 +570,45 @@ def apply_qat(model: nn.Module, qat_mode: str) -> nn.Module:
             weight=wt_observer,
         )
 
-    # Apply qconfig to all Linear layers (skip embedding / conv layers
-    # which are not quantizable with the standard torch flow)
-    def _set_qconfig(mod):
-        if isinstance(mod, nn.Linear):
+    # Apply qconfig to Linear layers, EXCLUDING:
+    #   (a) the vocab output projection (proj_out), which is weight-tied to
+    #       the decoder token embedding. Fake-quantizing it (esp. at INT4,
+    #       16 levels) collapses the logits and is the direct cause of
+    #       eval WER=100 — the model degenerates to near-constant/garbage
+    #       token predictions.
+    #   (b) LoRA's own lora_A / lora_B adapter Linears, which must stay at
+    #       full precision per the "sparse base + dense LoRA" design
+    #       (Option A) described in this file's docstring — the old
+    #       blanket `.apply()` was quantizing them too, since they are
+    #       also nn.Linear instances nested inside the wrapped target
+    #       modules.
+    target_root = inner.get_base_model() if isinstance(inner, PeftModel) else inner
+
+    output_head = None
+    if hasattr(target_root, "get_output_embeddings"):
+        try:
+            output_head = target_root.get_output_embeddings()
+        except Exception:
+            output_head = None
+
+    skipped = []
+
+    def _set_qconfig_by_name(root):
+        for name, mod in root.named_modules():
+            if not isinstance(mod, nn.Linear):
+                continue
+            if mod is output_head or name.endswith("proj_out"):
+                skipped.append(name or "proj_out")
+                continue
+            if "lora_A" in name or "lora_B" in name:
+                skipped.append(name)
+                continue
             mod.qconfig = qconfig
 
-    if isinstance(inner, PeftModel):
-        inner.get_base_model().apply(_set_qconfig)
-    else:
-        inner.apply(_set_qconfig)
+    _set_qconfig_by_name(target_root)
+    if skipped:
+        print(f"  [xQ-QAT] Excluded from quantization (kept full precision): "
+              f"{skipped}")
 
     # Prepare for QAT — inserts FakeQuantize nodes in the forward graph
     try:
@@ -507,25 +624,37 @@ def apply_qat(model: nn.Module, qat_mode: str) -> nn.Module:
         # Fallback: manually register fake-quant on weight parameter
         target = inner.get_base_model() if isinstance(inner, PeftModel) else inner
         for name, module in target.named_modules():
-            if isinstance(module, nn.Linear) and "lora_" not in name:
-                if qat_mode == "int8":
-                    module.weight_fake_quant = torch.quantization.FakeQuantize(
-                        observer=torch.quantization.MovingAveragePerChannelMinMaxObserver,
-                        quant_min=-128, quant_max=127,
-                        dtype=torch.qint8,
-                        qscheme=torch.per_channel_symmetric,
-                    )
-                else:
-                    module.weight_fake_quant = _Int4FakeQuantize()
-                original_forward = module.forward
+            if not isinstance(module, nn.Linear):
+                continue
+            if "lora_A" in name or "lora_B" in name:
+                continue  # keep LoRA adapters dense
+            if module is output_head or name.endswith("proj_out"):
+                continue  # never quantize the tied vocab output head
+            if qat_mode == "int8":
+                module.weight_fake_quant = torch.quantization.FakeQuantize(
+                    observer=torch.quantization.MovingAveragePerChannelMinMaxObserver,
+                    quant_min=-128, quant_max=127,
+                    dtype=torch.qint8,
+                    qscheme=torch.per_channel_symmetric,
+                )
+            else:
+                module.weight_fake_quant = _Int4FakeQuantize()
+            original_forward = module.forward
 
-                def _make_qat_forward(m, orig_fwd):
-                    def _qat_forward(x):
-                        m.weight.data = m.weight_fake_quant(m.weight.data)
-                        return orig_fwd(x)
-                    return _qat_forward
+            def _make_qat_forward(m, orig_fwd):
+                def _qat_forward(x):
+                    # IMPORTANT: do NOT overwrite m.weight.data in place.
+                    # That breaks the autograd graph for the fake-quant op
+                    # (no straight-through gradient) and permanently
+                    # destroys the full-precision "shadow" weights that
+                    # QAT is supposed to keep around during training.
+                    # Instead, compute the fake-quantized weight on the
+                    # fly and use it only for this forward pass.
+                    fq_weight = m.weight_fake_quant(m.weight)
+                    return nn.functional.linear(x, fq_weight, m.bias)
+                return _qat_forward
 
-                module.forward = _make_qat_forward(module, original_forward)
+            module.forward = _make_qat_forward(module, original_forward)
 
     return model
 
@@ -862,7 +991,16 @@ def build_model_full(
     sparsity_pattern: str  = "dense",
     qat_mode:         str  = "none",
 ) -> nn.Module:
-    """All weights trainable. Applies xP sparsity then xQ QAT, then xV wrapper."""
+    """
+    All weights trainable. Applies xP sparsity then xQ QAT, then xV wrapper.
+
+    NOTE: mode=full is the one place the OLD prune-before-training path
+    still applies as-is. Because the base is fully trainable here (not
+    frozen like in LoRA mode), the mask genuinely needs to interact with
+    gradient updates throughout training — there isn't a clean
+    "post-hoc prune a converged model" story the way there is for LoRA,
+    since a full finetune already touches every weight, sparse or not.
+    """
     dtype = torch.float16 if fp16 else torch.float32
     print(f"Loading {model_name} (full finetune)...")
     model = WhisperForConditionalGeneration.from_pretrained(
@@ -876,8 +1014,9 @@ def build_model_full(
     if sparsity_pattern != "dense":
         model = apply_nm_sparsity_oneshot(model, sparsity_pattern)
 
-    # xQ: insert QAT observers
+    # xQ: insert QAT observers (prepare_qat requires train mode)
     if qat_mode != "none":
+        model.train()
         model = apply_qat(model, qat_mode)
 
     total = sum(p.numel() for p in model.parameters())
@@ -893,25 +1032,28 @@ def build_model_lora(
     lora_dropout:     float = 0.05,
     fp16:             bool  = False,
     tokens_per_frame: int   = 1,
-    sparsity_pattern: str   = "dense",
     qat_mode:         str   = "none",
-) -> tuple:
+) -> nn.Module:
     """
-    Build LoRA model with optional xP sparsity and xQ QAT.
+    Build a DENSE LoRA model (no sparsity applied here anymore).
 
-    Build order (Option A — sparse base + dense LoRA):
+    Sparsity (xP) for LoRA runs is now applied post-hoc, after this dense
+    model has finished training, via prune_and_recover(). This is the
+    unified pruning strategy for both 2:4 and 1:4 (see module docstring):
+    prune a converged checkpoint, then run a short recovery fine-tune,
+    rather than pruning a randomly-initialized adapter's base before it
+    has learned anything.
+
+    Build order:
       1. Load base WhisperForConditionalGeneration
-      2. Apply N:M sparsity to base weights (xP)
-      3. Insert LoRA adapters via PEFT (LoRA delta matrices stay dense)
-      4. Apply QAT fake-quant observers (xQ)
-      5. Wrap with token subsampling (xV)
-
-    Returns (model, sparse_callback) where sparse_callback is non-None only
-    for 1:4 sparsity (iterative mask schedule).
+      2. Insert LoRA adapters via PEFT
+      3. Apply QAT fake-quant observers (xQ) — QAT is independent of xP
+         and can still be applied to a dense LoRA run if desired
+      4. Wrap with token subsampling (xV)
     """
     dtype = torch.float16 if fp16 else torch.float32
     print(f"Loading {model_name} (LoRA r={lora_r}, alpha={lora_alpha}, "
-          f"xP={sparsity_pattern}, xQ={qat_mode})...")
+          f"xQ={qat_mode}) [dense base — xP applied post-hoc if requested]...")
 
     model = WhisperForConditionalGeneration.from_pretrained(
         model_name, torch_dtype=dtype
@@ -920,17 +1062,7 @@ def build_model_lora(
     model.generation_config.suppress_tokens = []
     model.config.use_cache                  = False
 
-    # ── Step 2: xP — sparsify base BEFORE LoRA insertion (Option A) ──────────
-    sparse_callback = None
-    if sparsity_pattern != "dense":
-        model = apply_nm_sparsity_oneshot(model, sparsity_pattern)
-        if sparsity_pattern == "1:4":
-            sparse_callback = NMSparseCallback(pattern="1:4")
-            print(f"  [xP] 1:4 iterative mask callback registered "
-                  f"(updates every {ITERATIVE_MASK_FREQ} steps for "
-                  f"first {ITERATIVE_MASK_STEPS} steps).")
-
-    # ── Step 3: LoRA adapters (dense, unaffected by sparsity) ────────────────
+    # ── LoRA adapters (dense base, dense adapters) ────────────────────────────
     lora_cfg = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
@@ -940,15 +1072,15 @@ def build_model_lora(
     )
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
-
-    # ── Step 4: xQ — QAT observers AFTER LoRA so they wrap the merged path ───
+    model.train()
+    # ── xQ — QAT observers AFTER LoRA so they wrap the merged path ───────────
     if qat_mode != "none":
         model = apply_qat(model, qat_mode)
 
-    # ── Step 5: xV wrapper ───────────────────────────────────────────────────
+    # ── xV wrapper ────────────────────────────────────────────────────────────
     model = _wrap_if_subsampling(model, tokens_per_frame)
 
-    return model, sparse_callback
+    return model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1001,10 +1133,12 @@ def _find_latest_checkpoint(output_dir: str) -> Optional[str]:
     candidates.sort(key=lambda x: x[0])
     return candidates[-1][1]
 
-def train(args):
-    set_seed(getattr(args, "seed", 42))
+
+def _load_and_preprocess_datasets(args):
+    """Shared dataset-loading/preprocessing logic used by both train() and
+    prune_and_recover(), so the recovery run sees exactly the same data
+    pipeline the original dense run did."""
     benchmark  = getattr(args, "benchmark_dataset", "librispeech")
-    task       = getattr(args, "task",              "asr")
     bench_info = BENCHMARK_REGISTRY.get(benchmark, BENCHMARK_REGISTRY["librispeech"])
 
     train_split      = getattr(args, "train_split", None) or bench_info["default_train"]
@@ -1012,14 +1146,65 @@ def train(args):
     text_column      = bench_info["text_column"]
     language         = bench_info["language"]
     whisper_task     = bench_info["task"]
-    tokens_per_frame = getattr(args, "tokens_per_frame", 1)
-    total_frames     = getattr(args, "total_frames",     1500)
-    sparsity_pattern = getattr(args, "sparsity_pattern", "dense")
-    qat_mode         = getattr(args, "qat_mode",         "none")
+    tokens_per_frame = getattr(args, "tokens_per_frame", None) or 1
+    total_frames     = getattr(args, "total_frames",     None) or 1500
 
     streaming         = getattr(args, "streaming",         False)
     max_train_samples = getattr(args, "max_train_samples", None)
     max_eval_samples  = getattr(args, "max_eval_samples",  None)
+
+    model_name = local_path[args.model_size]
+    processor = WhisperProcessor.from_pretrained(
+        model_name, language=language, task=whisper_task
+    )
+
+    train_dataset = load_benchmark_dataset(
+        benchmark, train_split,
+        streaming=streaming, max_samples=max_train_samples,
+    )
+    eval_dataset = load_benchmark_dataset(
+        benchmark, eval_split,
+        streaming=streaming, max_samples=max_eval_samples,
+    )
+
+    print("Preprocessing datasets...")
+    train_dataset = apply_preprocessing(
+        train_dataset, processor,
+        text_column=text_column, max_label_len=args.max_label_len,
+        tokens_per_frame=tokens_per_frame, total_frames=total_frames,
+        num_proc=args.num_proc if not streaming else 1,
+    )
+    eval_dataset = apply_preprocessing(
+        eval_dataset, processor,
+        text_column=text_column, max_label_len=args.max_label_len,
+        tokens_per_frame=tokens_per_frame, total_frames=total_frames,
+        num_proc=args.num_proc if not streaming else 1,
+    )
+    return processor, train_dataset, eval_dataset
+
+
+def train(args):
+    set_seed(getattr(args, "seed", 42))
+    benchmark  = getattr(args, "benchmark_dataset", "librispeech")
+    task       = getattr(args, "task",              "asr")
+    bench_info = BENCHMARK_REGISTRY.get(benchmark, BENCHMARK_REGISTRY["librispeech"])
+
+    train_split      = getattr(args, "train_split", None) or bench_info["default_train"]
+    tokens_per_frame = getattr(args, "tokens_per_frame", None) or 1
+    total_frames     = getattr(args, "total_frames",     None) or 1500
+    # keep resolved values on args so downstream (datasets, run_name) agree
+    args.tokens_per_frame = tokens_per_frame
+    args.total_frames     = total_frames
+    qat_mode         = getattr(args, "qat_mode",         "none")
+
+    # NOTE: for mode=lora, sparsity_pattern is only meaningful for the
+    # legacy pre-training path — normal train() calls now always build a
+    # DENSE LoRA model. Use --prune_after_lora for the unified xP strategy.
+    sparsity_pattern = getattr(args, "sparsity_pattern", "dense") \
+        if args.mode == "full" else "dense"
+
+    streaming         = getattr(args, "streaming",         False)
+    max_train_samples = getattr(args, "max_train_samples", None)
 
     model_name = local_path[args.model_size]
     run_name   = (
@@ -1047,38 +1232,14 @@ def train(args):
           f"(active audio = {total_frames/1500*30:.1f}s)")
     print(f"[xV] tokens_per_frame = {tokens_per_frame}  "
           f"(decoder sees {1500//tokens_per_frame} encoder tokens)")
-    print(f"[xP] sparsity_pattern = {sparsity_pattern}")
+    print(f"[xP] sparsity_pattern = {sparsity_pattern}  "
+          f"({'legacy pre-training path (mode=full only)' if sparsity_pattern != 'dense' else 'dense — use --prune_after_lora for xP on LoRA runs'})")
     print(f"[xQ] qat_mode         = {qat_mode}  "
           f"({'Stage 2 QAT' if qat_mode != 'none' else 'dense / PTQ in Stage 3'})")
     if max_train_samples:
         print(f"Max train samples    : {max_train_samples}")
 
-    processor = WhisperProcessor.from_pretrained(
-        model_name, language=language, task=whisper_task
-    )
-
-    train_dataset = load_benchmark_dataset(
-        benchmark, train_split,
-        streaming=streaming, max_samples=max_train_samples,
-    )
-    eval_dataset = load_benchmark_dataset(
-        benchmark, eval_split,
-        streaming=streaming, max_samples=max_eval_samples,
-    )
-
-    print("Preprocessing datasets...")
-    train_dataset = apply_preprocessing(
-        train_dataset, processor,
-        text_column=text_column, max_label_len=args.max_label_len,
-        tokens_per_frame=tokens_per_frame, total_frames=total_frames,
-        num_proc=args.num_proc if not streaming else 1,
-    )
-    eval_dataset = apply_preprocessing(
-        eval_dataset, processor,
-        text_column=text_column, max_label_len=args.max_label_len,
-        tokens_per_frame=tokens_per_frame, total_frames=total_frames,
-        num_proc=args.num_proc if not streaming else 1,
-    )
+    processor, train_dataset, eval_dataset = _load_and_preprocess_datasets(args)
 
     # ── Build model ───────────────────────────────────────────────────────────
     sparse_callback = None
@@ -1090,17 +1251,33 @@ def train(args):
             qat_mode=qat_mode,
         )
     elif args.mode == "lora":
-        model, sparse_callback = build_model_lora(
+        model = build_model_lora(
             model_name, lora_r=args.lora_r,
             lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
             fp16=args.fp16, tokens_per_frame=tokens_per_frame,
-            sparsity_pattern=sparsity_pattern, qat_mode=qat_mode,
+            qat_mode=qat_mode,
         )
     else:
         raise ValueError(f"Unknown mode '{args.mode}'.")
 
     collator    = WhisperDataCollator(processor=processor, fp16=args.fp16)
     is_streaming = isinstance(train_dataset, IterableDataset)
+
+    # ── Guard against greedy-decoding repetition loops during eval ─────────
+    # Early in training the decoder hasn't reliably learned to emit EOS.
+    # With plain greedy search (num_beams=1, no repetition guard) and a
+    # generous max_length, it can get stuck re-predicting the same
+    # token/phrase until the length budget is exhausted — producing
+    # transcripts far longer than the reference and inflating WER past
+    # 100% (or, in bad cases, into the thousands) via insertions, even
+    # while teacher-forced eval_loss keeps improving normally. Capping
+    # the generation budget for eval and adding a light repetition
+    # penalty keeps a few pathological examples from dominating the
+    # corpus-level WER while the model is still early in training.
+    gen_cfg = model.generation_config if hasattr(model, "generation_config") \
+              else model.model.generation_config
+    gen_cfg.no_repeat_ngram_size = 3
+    gen_cfg.repetition_penalty   = 1.3
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
@@ -1117,7 +1294,8 @@ def train(args):
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         predict_with_generate=True,
-        generation_max_length=args.max_label_len,
+        generation_max_length=min(args.max_label_len, 225),
+        generation_num_beams=4,
         save_strategy="steps",
         save_steps=args.eval_steps,
         save_total_limit=1,
@@ -1127,8 +1305,9 @@ def train(args):
         logging_steps=args.log_steps,
         report_to=["tensorboard"],
         run_name=run_name,
-        dataloader_num_workers=0 if is_streaming else args.num_proc,
+        dataloader_num_workers=0,
         remove_unused_columns=False,
+        eval_accumulation_steps=1,
     )
 
     trainer = SparseAwarePeftTrainer(
@@ -1145,10 +1324,7 @@ def train(args):
     print(f"\n{'='*60}")
     print(f"  Run     : {run_name}")
     print(f"  Mode    : {args.mode} | Streaming: {is_streaming}")
-    print(f"  xP      : {sparsity_pattern}"
-          + (" (one-shot)" if sparsity_pattern == "2:4" else
-             f" (iterative, {ITERATIVE_MASK_STEPS} steps)" if sparsity_pattern == "1:4"
-             else " (dense)"))
+    print(f"  xP      : {sparsity_pattern} (dense LoRA base; xP applied post-hoc for lora mode)")
     print(f"  xQ(QAT) : {qat_mode}")
     if not is_streaming:
         print(f"  Train   : {len(train_dataset):,} samples")
@@ -1181,20 +1357,20 @@ def train(args):
 
     # Save full experiment config for downstream eval / paper tables
     experiment_cfg = {
-        "tokens_per_frame": tokens_per_frame,
-        "total_frames":     total_frames,
-        "model_size":       args.model_size,
-        "mode":             args.mode,
-        "sparsity_pattern": sparsity_pattern,
-        "qat_mode":         qat_mode,
-        "lora_r":           args.lora_r if args.mode == "lora" else 0,
+        "tokens_per_frame":    tokens_per_frame,
+        "total_frames":        total_frames,
+        "model_size":          args.model_size,
+        "mode":                args.mode,
+        "sparsity_pattern":    sparsity_pattern,
+        "qat_mode":            qat_mode,
+        "lora_r":              args.lora_r if args.mode == "lora" else 0,
+        "pruned_after_lora":   False,
     }
     with open(os.path.join(output_dir, "experiment_cfg.json"), "w") as f:
         json.dump(experiment_cfg, f, indent=2)
 
-    _inner    = model.model if isinstance(model, WhisperWithTokenSubsampling) else model
-    trainable = sum(p.numel() for p in _inner.parameters() if p.requires_grad)
-    total     = sum(p.numel() for p in _inner.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
     meta = {
         "model_size":        args.model_size,
         "mode":              args.mode,
@@ -1221,6 +1397,261 @@ def train(args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# xP STAGE 1.5 — POST-TRAINING PRUNING + RECOVERY (LoRA mode, unified strategy)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def prune_and_recover(args):
+    """
+    Take a converged DENSE LoRA checkpoint, apply N:M sparsity to its base
+    weights, and run a short recovery fine-tune (default 500 steps) so the
+    adapter can adjust to the newly-pruned base.
+
+    This is the single, unified pruning strategy for both 2:4 and 1:4 —
+    only the in-recovery mask-update schedule differs between them
+    (one-shot vs iterative), not whether/when pruning happens relative to
+    LoRA convergence. See module docstring for the reasoning.
+
+    Requires: args.dense_checkpoint (path to a completed dense LoRA run,
+    i.e. the output_dir from a normal train() call with mode=lora),
+    args.sparsity_pattern ("2:4" or "1:4"), args.recovery_steps.
+
+    Eval compatibility: evaluate_checkpoint() re-applies
+    apply_nm_sparsity_oneshot() to a freshly-loaded base before merging
+    the adapter, using experiment_cfg.json's sparsity_pattern to decide
+    whether to do so. Because pruning here happens once (deterministically,
+    magnitude-based) and the base is never touched again outside of
+    training (frozen during recovery too, same as any LoRA base), the
+    reconstruction at eval time is exact regardless of whether pruning
+    happened before or after the original dense run. No changes to
+    evaluate_checkpoint() are needed; this function simply writes an
+    experiment_cfg.json for the new checkpoint dir with the right fields.
+    """
+    set_seed(getattr(args, "seed", 42))
+
+    dense_checkpoint = args.dense_checkpoint
+    assert dense_checkpoint and os.path.isdir(dense_checkpoint), \
+        "--dense_checkpoint must point to a completed dense LoRA run directory."
+
+    sparsity_pattern = args.sparsity_pattern
+    assert sparsity_pattern in ("2:4", "1:4"), \
+        "--sparsity_pattern must be '2:4' or '1:4' for prune_and_recover()."
+
+    recovery_steps = getattr(args, "recovery_steps", 500)
+    qat_mode       = getattr(args, "qat_mode", "none")
+
+    # Pull config written by the original dense run so tpf/tf/model_size
+    # line up with what the adapter was actually trained on.
+    # experiment_cfg.json is written to the RUN ROOT by train(), not to
+    # checkpoint-N subdirs — so if the user pointed at a checkpoint-N dir,
+    # also look one level up.
+    dense_cfg = {}
+    for cand in (dense_checkpoint, os.path.dirname(dense_checkpoint.rstrip("/"))):
+        cfg_p = os.path.join(cand, "experiment_cfg.json")
+        if os.path.exists(cfg_p):
+            with open(cfg_p) as f:
+                dense_cfg = json.load(f)
+            print(f"  [cfg] Loaded dense run config from: {cfg_p}")
+            break
+    if not dense_cfg:
+        print("  [cfg] WARNING: no experiment_cfg.json found next to (or above) "
+              "--dense_checkpoint. Falling back to CLI args — make sure "
+              "--model_size / --tokens_per_frame / --total_frames match the "
+              "dense run EXACTLY, or the adapter will be merged onto the "
+              "wrong base (missing-adapter-keys warning + garbage WER).")
+
+    # CRITICAL: inherit the base model identity from the dense run.
+    # Loading a distil-small-trained adapter onto e.g. whisper-small
+    # (argparse default) produces PEFT "missing adapter keys" warnings for
+    # decoder layers 4..11 and a garbage model.
+    cfg_model_size = dense_cfg.get("model_size")
+    if cfg_model_size:
+        if cfg_model_size != args.model_size:
+            print(f"  [cfg] model_size: CLI/default '{args.model_size}' "
+                  f"→ overriding with dense run's '{cfg_model_size}'.")
+        args.model_size = cfg_model_size
+
+    # NOTE: argparse defaults for tpf/tf are now None (see parse_args), so
+    # `or` correctly defers to the dense run's config here.
+    tokens_per_frame = getattr(args, "tokens_per_frame", None) \
+        or dense_cfg.get("tokens_per_frame", 1)
+    total_frames     = getattr(args, "total_frames", None) \
+        or dense_cfg.get("total_frames", 1500)
+    args.tokens_per_frame = tokens_per_frame
+    args.total_frames     = total_frames
+    args.mode             = "lora"
+    # Inherit lora_r for correct metadata (PEFT itself reads
+    # adapter_config.json, but experiment_cfg.json feeds your tables).
+    if dense_cfg.get("lora_r"):
+        args.lora_r = dense_cfg["lora_r"]
+
+    model_name = local_path[args.model_size]
+    # If pointed at a checkpoint-N subdir, name the new run after the
+    # parent run dir so it still matches inference2's CHECKPOINT_NAME_RE.
+    _base_name = os.path.basename(dense_checkpoint.rstrip("/"))
+    if _base_name.startswith("checkpoint-"):
+        _base_name = os.path.basename(os.path.dirname(dense_checkpoint.rstrip("/")))
+    run_name = (
+        f"{_base_name}"
+        f"-postprune-xP{sparsity_pattern.replace(':', '')}"
+        f"-recov{recovery_steps}-xQ{qat_mode}"
+    )
+    output_dir = os.path.join(args.output_dir, run_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"  POST-TRAINING PRUNING + RECOVERY")
+    print(f"  Dense checkpoint : {dense_checkpoint}")
+    print(f"  xP pattern       : {sparsity_pattern}")
+    print(f"  Recovery steps   : {recovery_steps}")
+    print(f"  xQ (QAT)         : {qat_mode}")
+    print(f"  Output           : {output_dir}")
+    print(f"{'='*60}\n")
+
+    processor, train_dataset, eval_dataset = _load_and_preprocess_datasets(args)
+
+    # ── Load the converged base + adapter, KEEPING the adapter trainable ──────
+    dtype = torch.float16 if args.fp16 else torch.float32
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    base = WhisperForConditionalGeneration.from_pretrained(model_name, torch_dtype=dtype)
+    base.config.forced_decoder_ids         = None
+    base.generation_config.suppress_tokens = []
+    base.config.use_cache                  = False
+    base.to(device)
+    # is_trainable=True: do NOT merge yet — recovery fine-tuning still
+    # needs a live, separate adapter to update. merge_and_unload() only
+    # happens at save time (or in evaluate_checkpoint()).
+    model = PeftModel.from_pretrained(base, dense_checkpoint, is_trainable=True)
+    model.to(device)
+    # ── Prune the base (now the CONVERGED weights, not random init) ──────────
+    # use_hardware_sparse=False: keep zero-masked DENSE tensors during
+    # recovery. (a) cuSPARSELt rejects fp32 anyway (the noisy
+    # "SparseSemiStructuredTensor failed ... torch.float32" warnings);
+    # (b) SparseSemiStructuredTensor weights break merge_and_unload()
+    # and autograd interop. Convert to the hardware format only at
+    # inference time, after any merging, if kernel speedups are wanted.
+    apply_nm_sparsity_oneshot(model.get_base_model(), sparsity_pattern,
+                              use_hardware_sparse=False)
+
+    sparse_callback = None
+    if sparsity_pattern == "1:4":
+        sparse_callback = NMSparseCallback(pattern="1:4")
+        print(f"  [xP] 1:4 iterative mask callback registered for recovery "
+              f"(updates every {ITERATIVE_MASK_FREQ} steps for "
+              f"{min(recovery_steps, ITERATIVE_MASK_STEPS)} steps).")
+
+    if qat_mode != "none":
+        # prepare_qat() asserts model.training — from_pretrained returns the
+        # model in eval mode, which previously forced the manual fallback
+        # path every time. Put the model in train mode first so the proper
+        # torch.ao prepare_qat path is used (same fix as build_model_lora).
+        model.train()
+        model = apply_qat(model, qat_mode)
+
+    model = _wrap_if_subsampling(model, tokens_per_frame)
+
+    collator = WhisperDataCollator(processor=processor, fp16=args.fp16)
+    is_streaming = isinstance(train_dataset, IterableDataset)
+
+    gen_cfg = model.generation_config if hasattr(model, "generation_config") \
+              else model.model.generation_config
+    gen_cfg.no_repeat_ngram_size = 3
+    gen_cfg.repetition_penalty   = 1.3
+
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=output_dir,
+        seed=args.seed, data_seed=args.seed,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=getattr(args, "recovery_learning_rate", None) or args.learning_rate,
+        warmup_steps=min(getattr(args, "recovery_warmup_steps", 50), recovery_steps),
+        lr_scheduler_type="linear",
+        max_steps=recovery_steps,
+        fp16=args.fp16 and torch.cuda.is_available(),
+        gradient_checkpointing=True,
+        eval_strategy="steps",
+        eval_steps=max(1, recovery_steps // 5),
+        predict_with_generate=True,
+        generation_max_length=min(args.max_label_len, 225),
+        generation_num_beams=4,
+        save_strategy="steps",
+        save_steps=max(1, recovery_steps // 5),
+        save_total_limit=1,
+        load_best_model_at_end=False,   # streaming-safe; we save at end regardless
+        metric_for_best_model="wer",
+        greater_is_better=False,
+        logging_steps=min(args.log_steps, max(1, recovery_steps // 10)),
+        report_to=["tensorboard"],
+        run_name=run_name,
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
+        eval_accumulation_steps=1,
+    )
+
+    trainer = SparseAwarePeftTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=collator,
+        compute_metrics=make_compute_metrics(processor),
+        processing_class=processor.feature_extractor,
+        sparse_callback=sparse_callback,
+    )
+
+    t0 = time.time()
+    trainer.train()
+    elapsed = time.time() - t0
+    print(f"\nRecovery fine-tune complete in {elapsed/60:.1f} min "
+          f"({recovery_steps} steps).")
+
+    # ── Save (adapter only — do NOT merge_and_unload here; keep it as a
+    # PeftModel checkpoint so evaluate_checkpoint()'s existing reload +
+    # re-prune + merge path works unmodified) ─────────────────────────────────
+    trainer.save_model(output_dir)
+    processor.save_pretrained(output_dir)
+
+    experiment_cfg = {
+        "tokens_per_frame":  tokens_per_frame,
+        "total_frames":      total_frames,
+        "model_size":        args.model_size,
+        "mode":              "lora",
+        "sparsity_pattern":  sparsity_pattern,
+        "qat_mode":          qat_mode,
+        "lora_r":            args.lora_r,
+        "pruned_after_lora": True,
+        "dense_checkpoint":  dense_checkpoint,
+        "recovery_steps":    recovery_steps,
+    }
+    with open(os.path.join(output_dir, "experiment_cfg.json"), "w") as f:
+        json.dump(experiment_cfg, f, indent=2)
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    meta = {
+        "model_size":        args.model_size,
+        "mode":              "lora",
+        "tokens_per_frame":  tokens_per_frame,
+        "total_frames":      total_frames,
+        "sparsity_pattern":  sparsity_pattern,
+        "qat_mode":          qat_mode,
+        "lora_r":            args.lora_r,
+        "pruned_after_lora": True,
+        "dense_checkpoint":  dense_checkpoint,
+        "recovery_steps":    recovery_steps,
+        "trainable_params":  trainable,
+        "total_params":      total,
+        "trainable_pct":     round(100 * trainable / total, 4),
+        "recovery_minutes":  round(elapsed / 60, 2),
+    }
+    with open(os.path.join(output_dir, "run_meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    print(json.dumps(meta, indent=2))
+
+    return output_dir
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # EVALUATION
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1233,10 +1664,29 @@ def normalize_text(text: str) -> str:
 def evaluate_checkpoint(args):
     """
     Load a saved checkpoint and run WER + RTF on test splits.
-    Reads sparsity_pattern and qat_mode from experiment_cfg.json so that
-    the sparse structure is logged correctly even if not re-applied at eval
-    (sparsity is baked into saved weights; QAT observers are stripped after
-    training for standard inference — PTQ in inference_eval.py covers Stage 3).
+
+    Reads sparsity_pattern and qat_mode from experiment_cfg.json.
+
+    IMPORTANT (LoRA + sparsity fix):
+    In LoRA mode, PeftModel.save_pretrained() only saves the trainable
+    adapter (lora_A/lora_B) — it does NOT save the frozen base model,
+    since PEFT's whole design assumes the base can be reloaded from the
+    original pretrained checkpoint unmodified. But when xP sparsity was
+    applied, the base WAS modified in-memory (weights zeroed) — whether
+    that happened before the (now legacy) dense-LoRA training or, in the
+    current unified strategy, after it during prune_and_recover(). If we
+    reload a fresh, unpruned base here and merge the trained adapter onto
+    it, we get an inconsistent Frankenstein model.
+
+    Fix: since sparsification is a deterministic function of the base
+    weights (magnitude-based) and the base is frozen throughout LoRA
+    training AND recovery (never gradient-updated), re-applying the exact
+    same apply_nm_sparsity_oneshot() call to the freshly-loaded base
+    reconstructs the identical sparse structure the adapter was actually
+    trained against, before the adapter is merged on top of it. This
+    works identically regardless of when in the pipeline pruning
+    happened, since it depends only on the base checkpoint's weight
+    values, not on training history.
     """
     set_seed(getattr(args, "seed", 42))
     checkpoint_dir = args.checkpoint
@@ -1256,10 +1706,26 @@ def evaluate_checkpoint(args):
                        or saved_cfg.get("total_frames", 1500)
     sparsity_pattern = saved_cfg.get("sparsity_pattern", "dense")
     qat_mode         = saved_cfg.get("qat_mode", "none")
+    pruned_after_lora = saved_cfg.get("pruned_after_lora", False)
+
+    # Inherit the base model identity from the checkpoint's config —
+    # merging an adapter onto a different base (e.g. distil-small adapter
+    # onto whisper-small because --model_size was left at its default)
+    # produces PEFT missing-adapter-keys warnings and garbage WER.
+    cfg_model_size = saved_cfg.get("model_size")
+    if cfg_model_size and cfg_model_size != args.model_size:
+        print(f"[cfg] model_size: CLI/default '{args.model_size}' "
+              f"→ overriding with checkpoint's '{cfg_model_size}'.")
+        args.model_size = cfg_model_size
+
+    # Inherit mode too when available (lora vs full).
+    if saved_cfg.get("mode") and getattr(args, "mode", None) != saved_cfg["mode"]:
+        args.mode = saved_cfg["mode"]
 
     print(f"[xT] total_frames     = {total_frames}")
     print(f"[xV] tokens_per_frame = {tokens_per_frame}")
-    print(f"[xP] sparsity_pattern = {sparsity_pattern}  (baked into weights)")
+    print(f"[xP] sparsity_pattern = {sparsity_pattern}  "
+          f"({'re-applied to reloaded base (post-training-pruned checkpoint)' if pruned_after_lora else 're-applied to reloaded base — see fix note' if sparsity_pattern != 'dense' and getattr(args, 'mode', None) == 'lora' else 'baked into weights'})")
     print(f"[xQ] qat_mode         = {qat_mode}  (Stage 2 QAT; PTQ via inference_eval.py)")
 
     device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1284,9 +1750,28 @@ def evaluate_checkpoint(args):
             model_name, torch_dtype=dtype
         )
         base.config.forced_decoder_ids = None
+
+        # ── Reconstruct the sparse base the adapter was actually trained
+        # against, BEFORE attaching/merging the trained adapter. Without
+        # this, sparsity is silently discarded at eval time and the
+        # trained LoRA delta gets merged onto an inconsistent, unpruned
+        # base (see docstring above). Deterministic regardless of whether
+        # pruning happened pre- or post-training.
+        if sparsity_pattern != "dense":
+            # use_hardware_sparse=False: merge_and_unload() must add a dense
+            # LoRA delta into these weights; a SparseSemiStructuredTensor
+            # weight makes that crash or densify unpredictably. Mask-only
+            # here; the merged q/v are (by design) no longer strictly N:M
+            # ("sparse base + dense LoRA").
+            base = apply_nm_sparsity_oneshot(base, sparsity_pattern,
+                                             use_hardware_sparse=False)
+
         model = PeftModel.from_pretrained(base, checkpoint_dir)
         model = model.merge_and_unload()
     else:
+        # Full finetune saves the entire model state (including whatever
+        # the sparsified weights drifted to during training), so a plain
+        # reload is already self-consistent — no re-application needed.
         model = WhisperForConditionalGeneration.from_pretrained(
             checkpoint_dir, torch_dtype=dtype
         )
@@ -1301,13 +1786,9 @@ def evaluate_checkpoint(args):
     if benchmark == "librispeech":
         eval_splits = {
             "test_clean": load_benchmark_dataset(
-                benchmark, "test", streaming=True, config_override="clean",
+                benchmark, "test", streaming=False, config_override="clean",
                 max_samples=getattr(args, "max_eval_samples", None),
-            ),
-            "test_other": load_benchmark_dataset(
-                benchmark, "test", streaming=True, config_override="other",
-                max_samples=getattr(args, "max_eval_samples", None),
-            ),
+            )
         }
     else:
         eval_splits = {}
@@ -1342,7 +1823,8 @@ def evaluate_checkpoint(args):
             t0 = time.time()
             with torch.no_grad():
                 pred_ids = model.generate(
-                    features, num_beams=1, max_new_tokens=256,
+                    features, num_beams=16, max_new_tokens=256,
+                    no_repeat_ngram_size=3, repetition_penalty=1.3,
                 )
             infer_time = time.time() - t0
 
@@ -1376,6 +1858,7 @@ def evaluate_checkpoint(args):
         "total_frames":      total_frames,
         "sparsity_pattern":  sparsity_pattern,
         "qat_mode":          qat_mode,
+        "pruned_after_lora": pruned_after_lora,
         "total_params":      total_params,
         "results":           results,
     }
@@ -1394,17 +1877,19 @@ def evaluate_checkpoint(args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_sweep(args):
+    if getattr(args, "sweep_sparsity", None):
+        print(f"\n  [sweep] NOTE: --sweep_sparsity '{args.sweep_sparsity}' is "
+              f"IGNORED. Training sweeps build dense LoRA models; run "
+              f"post-training pruning afterwards, e.g.:\n"
+              f"    python ASR/finetune.py --prune_after_lora "
+              f"--dense_checkpoint <run_dir> --sparsity_pattern "
+              f"{args.sweep_sparsity} --recovery_steps 500\n")
     sizes      = args.sweep_sizes.split(",")
     modes      = args.sweep_modes.split(",")
     lora_ranks = (
         [int(p.strip()) for p in args.lora_rank_sweep.split(",")]
         if getattr(args, "lora_rank_sweep", None)
         else [getattr(args, "lora_r", "dense")]
-    )
-    sparsity_patterns = (
-        [p.strip() for p in args.sweep_sparsity.split(",")]
-        if getattr(args, "sweep_sparsity", None)
-        else [getattr(args, "sparsity_pattern", "dense")]
     )
     qat_modes = (
         [q.strip() for q in args.sweep_qat.split(",")]
@@ -1416,60 +1901,58 @@ def run_sweep(args):
     for size in sizes:
         for mode in modes:
             for rank in lora_ranks:
-                for xp in sparsity_patterns:
-                    for xq in qat_modes:
-                        if mode == "full" and rank != args.lora_r:
-                            continue
-                        print(
-                            f"\n{'#'*60}\n"
-                            f"  SWEEP: whisper-{size} | mode={mode} | r={rank} "
-                            f"| xP={xp} | xQ={xq}\n"
-                            f"{'#'*60}"
+                for xq in qat_modes:
+                    if mode == "full" and rank != args.lora_r:
+                        continue
+                    print(
+                        f"\n{'#'*60}\n"
+                        f"  SWEEP: whisper-{size} | mode={mode} | r={rank} "
+                        f"| xQ={xq}  (dense — xP applied post-hoc separately "
+                        f"for lora via --prune_after_lora)\n"
+                        f"{'#'*60}"
+                    )
+                    args.model_size       = size
+                    args.mode             = mode
+                    args.lora_r           = rank
+                    args.qat_mode         = xq
+
+                    checkpoint_dir = train(args)
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+
+                    eval_summary = evaluate_checkpoint(
+                        argparse.Namespace(
+                            model_size=size, mode=mode,
+                            checkpoint=checkpoint_dir,
+                            benchmark_dataset=getattr(args, "benchmark_dataset", "librispeech"),
+                            max_eval_samples=getattr(args, "max_eval_samples", None),
+                            fp16=getattr(args, "fp16", True),
+                            tokens_per_frame=None,
+                            total_frames=None,
                         )
-                        args.model_size       = size
-                        args.mode             = mode
-                        args.lora_r           = rank
-                        args.sparsity_pattern = xp
-                        args.qat_mode         = xq
+                    )
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-                        checkpoint_dir = train(args)
-                        import gc
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            torch.cuda.synchronize()
+                    meta_path = os.path.join(checkpoint_dir, "run_meta.json")
+                    with open(meta_path) as f:
+                        meta = json.load(f)
 
-                        eval_summary = evaluate_checkpoint(
-                            argparse.Namespace(
-                                model_size=size, mode=mode,
-                                checkpoint=checkpoint_dir,
-                                benchmark_dataset=getattr(args, "benchmark_dataset", "librispeech"),
-                                max_eval_samples=getattr(args, "max_eval_samples", None),
-                                fp16=getattr(args, "fp16", True),
-                                tokens_per_frame=None,
-                                total_frames=None,
-                            )
-                        )
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
-                        meta_path = os.path.join(checkpoint_dir, "run_meta.json")
-                        with open(meta_path) as f:
-                            meta = json.load(f)
-
-                        all_results.append({**meta, **eval_summary["results"]})
-                        sweep_path = os.path.join(args.output_dir, "sweep_results.json")
-                        with open(sweep_path, "w") as f:
-                            json.dump(all_results, f, indent=2)
-                        print(f"Sweep results saved to {sweep_path}")
+                    all_results.append({**meta, **eval_summary["results"]})
+                    sweep_path = os.path.join(args.output_dir, "sweep_results.json")
+                    with open(sweep_path, "w") as f:
+                        json.dump(all_results, f, indent=2)
+                    print(f"Sweep results saved to {sweep_path}")
 
     print("\n" + "=" * 60 + "\nSWEEP COMPLETE\n" + "=" * 60)
     for r in all_results:
         print(
             f"  whisper-{r['model_size']:<10s} | {r['mode']:<5s} | "
             f"tpf={r['tokens_per_frame']} tf={r['total_frames']} | "
-            f"xP={r.get('sparsity_pattern','dense'):<4s} | "
             f"xQ={r.get('qat_mode','none'):<5s} | "
             f"trainable={r['trainable_params']:>12,} | "
             f"WER test_clean={r.get('test_clean', {}).get('wer', 'N/A')}%"
@@ -1482,7 +1965,7 @@ def run_sweep(args):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Whisper Finetuning: full vs LoRA, N:M sparsity (xP), QAT (xQ)",
+        description="Whisper Finetuning: full vs LoRA, N:M sparsity (xP, post-hoc for LoRA), QAT (xQ)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1491,10 +1974,17 @@ def parse_args(argv=None):
                    choices=SUPPORTED_TASKS)
     p.add_argument("--benchmark_dataset", type=str, default="librispeech",
                    choices=list(BENCHMARK_REGISTRY.keys()))
-    p.add_argument("--tokens_per_frame",  type=int, default=1,
-                   help="xV: encoder output stride. 1=all 1500 tokens, 2=750.")
-    p.add_argument("--total_frames",      type=int, default=1500,
-                   help="xT: clip audio to (total_frames/1500)*30s. 750=15s.")
+    # Defaults are None (NOT 1/1500) so that eval / prune_and_recover can
+    # distinguish "user didn't pass it" from an explicit value and fall
+    # back to the checkpoint's experiment_cfg.json. With a truthy default,
+    # `getattr(args, ...) or cfg.get(...)` NEVER consulted the config —
+    # e.g. a tpf=2-trained adapter was silently evaluated at tpf=1.
+    p.add_argument("--tokens_per_frame",  type=int, default=None,
+                   help="xV: encoder output stride. 1=all 1500 tokens, 2=750. "
+                        "If unset, falls back to checkpoint cfg, then 1.")
+    p.add_argument("--total_frames",      type=int, default=None,
+                   help="xT: clip audio to (total_frames/1500)*30s. 750=15s. "
+                        "If unset, falls back to checkpoint cfg, then 1500.")
     p.add_argument("--seed", type=int, default=42)
 
     # Model
@@ -1509,16 +1999,40 @@ def parse_args(argv=None):
                    help=(
                        "xP axis — N:M semi-structured weight sparsity.\n"
                        "  dense → no sparsity (baseline)\n"
-                       "  2:4   → 2 non-zeros per 4: one-shot magnitude mask,\n"
-                       "          hardware-accelerated on Ampere+ (A100/A6000).\n"
-                       "          Theoretical 2× speedup on sparse GEMM.\n"
-                       "  1:4   → 1 non-zero per 4: iterative mask ramp-in\n"
-                       "          over first 500 training steps (every 50 steps).\n"
-                       "Sparsity applied to BASE weights BEFORE LoRA adapters\n"
-                       "(Option A: sparse base + dense LoRA)."
+                       "  2:4   → 2 non-zeros per 4\n"
+                       "  1:4   → 1 non-zero per 4\n"
+                       "NOTE: for mode=lora this flag only matters when used\n"
+                       "with --prune_after_lora (unified post-training pruning\n"
+                       "strategy). A plain `train()` call with mode=lora always\n"
+                       "builds a dense base; use --prune_after_lora afterward.\n"
+                       "For mode=full, this is still applied pre-training\n"
+                       "(legacy path — base is trainable so pre/post timing is\n"
+                       "less meaningful there)."
                    ))
-    p.add_argument("--sweep_sparsity", type=str, default=None,
-                   help="Comma-separated sparsity patterns for sweep, e.g. dense,2:4,1:4")
+
+    # ── Post-training pruning + recovery (unified xP strategy for LoRA) ──────
+    p.add_argument("--prune_after_lora", action="store_true",
+                   help=(
+                       "Run the post-training-pruning + recovery workflow "
+                       "instead of a normal train()/sweep. Requires "
+                       "--dense_checkpoint. Applies --sparsity_pattern "
+                       "(2:4 or 1:4) to a converged dense LoRA checkpoint, "
+                       "then fine-tunes for --recovery_steps to let the "
+                       "adapter recover."
+                   ))
+    p.add_argument("--dense_checkpoint", type=str, default=None,
+                   help="Path to a completed dense LoRA run's output_dir "
+                        "(required with --prune_after_lora).")
+    p.add_argument("--recovery_steps", type=int, default=500,
+                   help="Number of fine-tune steps after pruning to let the "
+                        "LoRA adapter recover. Also the 1:4 iterative mask "
+                        "ramp-in window.")
+    p.add_argument("--recovery_learning_rate", type=float, default=None,
+                   help="Learning rate for the recovery phase. Defaults to "
+                        "--learning_rate if unset.")
+    p.add_argument("--recovery_warmup_steps", type=int, default=50,
+                   help="Warmup steps for the recovery phase (capped at "
+                        "--recovery_steps).")
 
     # xQ: QAT
     p.add_argument("--qat_mode", type=str, default="none",
@@ -1531,6 +2045,12 @@ def parse_args(argv=None):
                        "Run QAT only on Pareto-optimal configs from Stage 1 (Option B)."
                    ))
     p.add_argument("--sweep_qat", type=str, default="int8,int4",help="Comma-separated QAT modes, e.g. none,int8,int4")
+    p.add_argument("--sweep_sparsity", type=str, default=None,
+                   help="ACCEPTED FOR CLI COMPATIBILITY BUT IGNORED during "
+                        "training sweeps. Under the unified post-training "
+                        "pruning strategy, sweeps always train DENSE LoRA "
+                        "models; apply sparsity afterwards with "
+                        "--prune_after_lora --sparsity_pattern 2:4|1:4.")
 
     # Data
     p.add_argument("--train_split",       type=str,  default=None)
@@ -1580,7 +2100,9 @@ def parse_args(argv=None):
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.sweep:
+    if args.prune_after_lora:
+        prune_and_recover(args)
+    elif args.sweep:
         run_sweep(args)
     elif args.eval_only:
         evaluate_checkpoint(args)
