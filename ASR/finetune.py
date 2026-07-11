@@ -434,41 +434,43 @@ def apply_nm_sparsity_oneshot(
 
 class NMSparseCallback:
     """
-    Training callback that implements the iterative mask-update schedule
-    for 1:4 sparsity during the RECOVERY window (first ITERATIVE_MASK_STEPS
-    steps after post-training pruning).
+    Enforces N:M sparsity DURING training by recomputing a magnitude-based
+    mask and re-zeroing pruned positions at every training step.
 
-    At each update step, magnitude-based N:M masks are recomputed on the
-    current weight values. After ITERATIVE_MASK_STEPS steps the mask is
-    frozen (no further updates), allowing the model to converge stably.
+    This matters most for mode=full: unlike LoRA mode (where the base is
+    frozen by PEFT and a one-shot zero-out survives training untouched
+    automatically), a full finetune leaves EVERY weight trainable, so a
+    one-shot prune applied before training gets silently regrown by the
+    optimizer within a few hundred steps if nothing re-enforces it. This
+    mirrors Algorithm 1 in the reference paper (USM-Lite): step 7
+    ("Prune each weight matrix of W through the mask with eq.(4)") runs
+    unconditionally on every iteration t, for both one-shot and few-shot
+    patterns — only the MASK ITSELF (which positions are zeroed) updates
+    on a schedule; the zeroing is continuous throughout all of training.
 
-    Usage: instantiate before the recovery fine-tune, call
-    .on_step_end(model, step) from a custom Trainer subclass or training
-    loop.
+    Practically, recomputing top-(M-N)-smallest-magnitude every step (as
+    below) reduces to exactly this: previously-zeroed positions have
+    magnitude 0 and are trivially re-selected as "smallest" again unless
+    gradients have pushed some other position lower still, so the pattern
+    self-stabilizes. This is the standard prune-in-the-loop recipe used
+    by most N:M-sparse training implementations (e.g. NVIDIA ASP).
 
-    For 2:4 sparsity the mask is one-shot (fixed at the start of
-    recovery), so this callback is a no-op and need not be attached.
+    Usage: instantiate once per training run (any pattern), call
+    .on_step_end(model, step) after every optimizer step from a Trainer
+    subclass (see SparseAwarePeftTrainer).
     """
 
     def __init__(self, pattern: str = "1:4"):
-        assert pattern in ("1:4",), \
-            "NMSparseCallback is only needed for 1:4 iterative schedule."
+        assert pattern in ("2:4", "1:4"), \
+            "NMSparseCallback pattern must be '2:4' or '1:4'."
         self.pattern   = pattern
         self.n, self.m = int(pattern.split(":")[0]), int(pattern.split(":")[1])
-        self.active    = True    # set False after ITERATIVE_MASK_STEPS
 
     def on_step_end(self, model: nn.Module, step: int):
-        """Call this at the end of each training step."""
-        if not self.active:
-            return
-        if step > ITERATIVE_MASK_STEPS:
-            self.active = False
-            print(f"  [xP] 1:4 mask frozen at step {step} "
-                  f"(iterative schedule complete).")
-            return
-        if step % ITERATIVE_MASK_FREQ != 0:
-            return
-
+        """Call this at the end of each training step. Runs for the full
+        duration of training — sparsity must be continuously re-enforced
+        whenever the underlying weights are trainable (mode=full); for
+        LoRA-frozen bases this is a harmless no-op safety net."""
         n, m = self.n, self.m
         with torch.no_grad():
             base = model
@@ -1001,7 +1003,18 @@ def build_model_full(
     "post-hoc prune a converged model" story the way there is for LoRA,
     since a full finetune already touches every weight, sparse or not.
     """
-    dtype = torch.float16 if fp16 else torch.float32
+    # TRAINING loads at fp32 regardless of --fp16. The Trainer's own
+    # fp16=True (set below via Seq2SeqTrainingArguments) drives real
+    # torch.cuda.amp mixed precision: autocast casts activations to fp16
+    # under the hood for the forward/backward pass while GradScaler
+    # expects fp32 MASTER weights/gradients to unscale against. Loading
+    # literal torch.float16 weights here as well double-applies fp16 and
+    # crashes with "Attempting to unscale FP16 gradients" the moment
+    # gradient clipping runs, because gradients w.r.t. fp16 parameters
+    # are themselves fp16, which GradScaler explicitly refuses to
+    # unscale. --fp16 still fully controls training precision — it just
+    # now does so the way Trainer's AMP is designed to be driven.
+    dtype = torch.float32
     print(f"Loading {model_name} (full finetune)...")
     model = WhisperForConditionalGeneration.from_pretrained(
         model_name, torch_dtype=dtype
@@ -1051,7 +1064,13 @@ def build_model_lora(
          and can still be applied to a dense LoRA run if desired
       4. Wrap with token subsampling (xV)
     """
-    dtype = torch.float16 if fp16 else torch.float32
+    # See build_model_full for why training always loads at fp32 and lets
+    # the Trainer's fp16=True AMP flag (Seq2SeqTrainingArguments) drive
+    # mixed precision instead of literal fp16 weights — otherwise LoRA's
+    # adapter weights (which PEFT creates matching the base layer's
+    # dtype) end up fp16 too, and GradScaler crashes trying to unscale
+    # fp16 gradients during grad-norm clipping.
+    dtype = torch.float32
     print(f"Loading {model_name} (LoRA r={lora_r}, alpha={lora_alpha}, "
           f"xQ={qat_mode}) [dense base — xP applied post-hoc if requested]...")
 
@@ -1243,6 +1262,17 @@ def train(args):
 
     # ── Build model ───────────────────────────────────────────────────────────
     sparse_callback = None
+    if args.mode == "full" and sparsity_pattern != "dense":
+        # ESSENTIAL for mode=full: every weight is trainable here (unlike
+        # LoRA, where PEFT freezes the base and a one-shot prune survives
+        # training untouched automatically). Without this, the one-shot
+        # prune in build_model_full() gets silently regrown by the
+        # optimizer within a few hundred steps and experiment_cfg.json's
+        # "sparsity_pattern" would no longer reflect the actual weights.
+        sparse_callback = NMSparseCallback(pattern=sparsity_pattern)
+        print(f"  [xP] Sparsity enforcement callback registered for mode=full "
+              f"training ({sparsity_pattern}, enforced every step for the "
+              f"full {args.max_steps} steps).")
     if args.mode == "full":
         model = build_model_full(
             model_name, fp16=args.fp16,
@@ -1510,7 +1540,10 @@ def prune_and_recover(args):
     processor, train_dataset, eval_dataset = _load_and_preprocess_datasets(args)
 
     # ── Load the converged base + adapter, KEEPING the adapter trainable ──────
-    dtype = torch.float16 if args.fp16 else torch.float32
+    # See build_model_full for why: training always loads fp32, letting
+    # Trainer's fp16=True AMP flag (below) drive mixed precision, so
+    # GradScaler has fp32 master weights/gradients to unscale.
+    dtype = torch.float32
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     base = WhisperForConditionalGeneration.from_pretrained(model_name, torch_dtype=dtype)
     base.config.forced_decoder_ids         = None
@@ -1532,12 +1565,14 @@ def prune_and_recover(args):
     apply_nm_sparsity_oneshot(model.get_base_model(), sparsity_pattern,
                               use_hardware_sparse=False)
 
-    sparse_callback = None
-    if sparsity_pattern == "1:4":
-        sparse_callback = NMSparseCallback(pattern="1:4")
-        print(f"  [xP] 1:4 iterative mask callback registered for recovery "
-              f"(updates every {ITERATIVE_MASK_FREQ} steps for "
-              f"{min(recovery_steps, ITERATIVE_MASK_STEPS)} steps).")
+    # Defense-in-depth: the base IS frozen by PEFT during LoRA recovery
+    # (only lora_A/lora_B get gradients), so the one-shot zero-out above
+    # already survives untouched with no further action needed. This
+    # callback is a cheap no-op safety net against that assumption ever
+    # being violated, and is now generalized to both patterns (the
+    # callback itself no longer has a "ramp then go idle" cutoff — see
+    # NMSparseCallback docstring).
+    sparse_callback = NMSparseCallback(pattern=sparsity_pattern)
 
     if qat_mode != "none":
         # prepare_qat() asserts model.training — from_pretrained returns the
