@@ -414,17 +414,56 @@ def apply_quantization(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def measure_model_size_mb(model: torch.nn.Module, quantization: str) -> float:
+    """
+    True in-memory size in MB, walking BOTH .parameters()/.buffers() AND
+    state_dict() directly — necessary because torch.quantization.
+    quantize_dynamic() (the real INT8 conversion path, see
+    load_int8_converted_full/lora below) hides its real weight bytes from
+    normal iteration entirely: the packed weight lives inside an opaque
+    `_packed_params._packed_params` tuple, invisible to
+    .parameters()/.named_buffers() (verified empirically: sum of
+    .parameters().numel() is exactly ZERO for a dynamically-quantized
+    model). Only reachable via state_dict().
+    """
     inner = model.model if isinstance(model, WhisperWithTokenSubsampling) else model
-    total_bytes = 0
-    for param in inner.parameters():
-        if param.dtype == torch.float32:
-            total_bytes += param.nelement() * 4
-        elif param.dtype in (torch.float16, torch.bfloat16):
-            total_bytes += param.nelement() * 2
-        elif param.dtype == torch.int8:
-            total_bytes += param.nelement() * 1
+
+    def _bytes_for_tensor(t: torch.Tensor) -> float:
+        if t.dtype == torch.float32:
+            return t.nelement() * 4
+        elif t.dtype in (torch.float16, torch.bfloat16):
+            return t.nelement() * 2
+        elif t.dtype in (torch.int8, torch.uint8, torch.qint8, torch.quint8):
+            return t.nelement() * 1
         else:
-            total_bytes += param.nelement() * 0.5
+            return t.nelement() * t.element_size()
+
+    total_bytes = 0.0
+    seen_ids = set()
+
+    for param in inner.parameters():
+        total_bytes += _bytes_for_tensor(param.data)
+        seen_ids.add(id(param))
+    for buf in inner.buffers():
+        if id(buf) in seen_ids:
+            continue
+        total_bytes += _bytes_for_tensor(buf)
+        seen_ids.add(id(buf))
+
+    # quantize_dynamic() path: packed weights are invisible above; only
+    # reachable by walking state_dict() directly.
+    try:
+        sd = inner.state_dict()
+    except Exception:
+        sd = {}
+    for key, val in sd.items():
+        if not key.endswith("_packed_params._packed_params"):
+            continue
+        if isinstance(val, tuple):
+            for item in val:
+                if isinstance(item, torch.Tensor):
+                    raw = item.int_repr() if item.is_quantized else item
+                    total_bytes += _bytes_for_tensor(raw)
+
     return round(total_bytes / (1024 ** 2), 2)
 
 
@@ -767,6 +806,178 @@ def get_vram_used_gb(idx: int = 0) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LOADING GENUINELY QUANTIZED (converted) CHECKPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+# Companion to finetune.py's finalize_and_convert(): loads checkpoints that
+# went through REAL torch.quantization.quantize_dynamic() conversion
+# (qat_mode="int8" with experiment_cfg.json's "qat_converted": true), as
+# distinct from the fake-quant-then-stripped checkpoints load_model_for_
+# inference() already handles below. INT4 never produces a converted
+# artifact (no native torch int4 tensor type — see finalize_and_convert's
+# docstring), so "qat_converted" is only ever true for int8.
+
+def _quantize_dynamic_matching_skeleton(target: torch.nn.Module) -> torch.nn.Module:
+    """
+    Rebuild the EXACT SAME quantize_dynamic() call finetune.py's
+    finalize_and_convert() used, so the resulting module tree's keys
+    match the saved state_dict before load_state_dict() runs. A packed
+    quantized Linear's weight lives inside an opaque
+    `_packed_params._packed_params` tuple — a completely different
+    key/shape than a plain Linear's .weight/.bias — so load_state_dict()
+    only works if the target already has matching structure going in.
+
+    MUST use identical exclusion logic to finetune.py's
+    finalize_and_convert() (proj_out / lora_A / lora_B kept full
+    precision) or the module tree won't line up. If that exclusion logic
+    ever changes in finetune.py without a matching change here, this will
+    surface as missing/unexpected keys at load time (see
+    load_int8_converted_full's warning) rather than silently wrong
+    results — but keeping the two in sync is a real, manual
+    responsibility this split creates.
+    """
+    output_head = target.get_output_embeddings() \
+        if hasattr(target, "get_output_embeddings") else None
+    qspec = {}
+    for name, mod in target.named_modules():
+        if not isinstance(mod, torch.nn.Linear):
+            continue
+        if mod is output_head or name.endswith("proj_out"):
+            continue
+        if "lora_A" in name or "lora_B" in name:
+            continue
+        qspec[name] = torch.quantization.default_dynamic_qconfig
+    return torch.quantization.quantize_dynamic(
+        target, qconfig_spec=qspec, dtype=torch.qint8,
+    )
+
+
+def load_int8_converted_full(checkpoint_dir: str, model_size: str) -> torch.nn.Module:
+    """
+    Load a mode=full checkpoint that went through finalize_and_convert()'s
+    real INT8 conversion. Rebuilds the identical quantize_dynamic()
+    skeleton first, then load_state_dict()s the real saved weights from
+    pytorch_model_quantized.bin (torch.save'd, not safetensors — packed
+    quantized tensors can't be represented in safetensors' format).
+
+    Stays on CPU throughout: eager-mode dynamic quantization has no CUDA
+    kernels.
+    """
+    print(f"  [xQ-load] Rebuilding INT8-converted skeleton for mode=full "
+          f"checkpoint: {checkpoint_dir}")
+    _cfg_source = checkpoint_dir if os.path.exists(
+        os.path.join(checkpoint_dir, "config.json")) else LOCAL_PATH[model_size]
+    skeleton = WhisperForConditionalGeneration.from_pretrained(
+        _cfg_source, torch_dtype=torch.float32, low_cpu_mem_usage=False,
+    )
+    skeleton.config.forced_decoder_ids         = None
+    skeleton.generation_config.suppress_tokens = []
+    skeleton.config.use_cache                  = True
+    skeleton.eval()
+    skeleton = _quantize_dynamic_matching_skeleton(skeleton)
+
+    state_path = os.path.join(checkpoint_dir, "pytorch_model_quantized.bin")
+    assert os.path.exists(state_path), (
+        f"Expected converted state dict at {state_path} but it's missing "
+        f"— experiment_cfg.json says qat_converted=True but this doesn't "
+        f"look like a checkpoint finalize_and_convert() actually produced."
+    )
+    state_dict = torch.load(state_path, map_location="cpu")
+    missing, unexpected = skeleton.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        print(f"  [xQ-load] WARNING: {len(missing)} missing / "
+              f"{len(unexpected)} unexpected key(s) loading the converted "
+              f"state dict. This usually means the exclusion logic here "
+              f"(proj_out/lora_A/lora_B) has drifted out of sync with "
+              f"finetune.py's finalize_and_convert() — check both match.")
+        if missing:
+            print(f"    missing (first 5): {missing[:5]}")
+        if unexpected:
+            print(f"    unexpected (first 5): {unexpected[:5]}")
+    else:
+        print(f"  [xQ-load] Converted state dict loaded cleanly "
+              f"(0 missing, 0 unexpected keys).")
+
+    return skeleton
+
+
+def load_int8_converted_lora(checkpoint_dir: str, model_size: str,
+                              sparsity_pattern: str) -> torch.nn.Module:
+    """
+    Load a mode=lora checkpoint whose BASE went through real INT8
+    conversion during training/recovery. Unlike mode=full, nothing about
+    the quantized base needs to be saved OR loaded at all: the base is
+    frozen throughout LoRA training (never gradient-updated — verified
+    directly by inspecting q_proj.base_layer.weight.grad during
+    development), so its final weight values are a pure, deterministic
+    function of (a) the original pretrained weights and (b) the
+    magnitude-pruning mask if sparsity_pattern != "dense". Reconstructing
+    it here reproduces bit-identical results to what training actually
+    used — zero calibration state needs to survive a save/reload
+    boundary.
+
+    ORDER MATTERS: prune -> ATTACH the LoRA adapter -> THEN quantize the
+    base (targeting get_base_model(), which correctly hits q_proj.
+    base_layer while excluding lora_A/lora_B). Quantizing before
+    attaching the adapter breaks PEFT's from_pretrained(), which needs to
+    wrap q_proj/v_proj in lora.Linear and only knows how to wrap standard
+    module types — not an already-quantized DynamicQuantizedLinear
+    (raises "Target module DynamicQuantizedLinear(...) is not
+    supported."). This matches the sequence actually used during
+    training/recovery (prune -> attach/keep adapter -> apply QAT).
+
+    merge_and_unload() is NOT possible here and is deliberately skipped:
+    merging adds a float LoRA delta directly into the base's weight
+    tensor, which has no defined meaning against a packed int8
+    representation. Base and adapter stay separate live modules — PEFT's
+    own lora.Linear.forward() (base_layer(x) + lora_B(lora_A(x))*scaling)
+    handles this with no other changes needed, verified structurally
+    (forward pass through a quantized base_layer + full-precision
+    adapter) in a minimal PEFT+LoRA test model during development.
+
+    Stays on CPU throughout (see load_int8_converted_full).
+    """
+    print(f"  [xQ-load] Reconstructing base for mode=lora "
+          f"checkpoint: {checkpoint_dir}")
+    base = WhisperForConditionalGeneration.from_pretrained(
+        LOCAL_PATH[model_size], torch_dtype=torch.float32, low_cpu_mem_usage=False,
+    )
+    base.config.forced_decoder_ids         = None
+    base.generation_config.suppress_tokens = []
+    base.config.use_cache                  = True
+
+    if sparsity_pattern != "dense":
+        base = _prune_base_nm(base, sparsity_pattern)
+
+    # ── ORDER MATTERS: attach the LoRA adapter BEFORE quantizing. ────────────
+    # PEFT's from_pretrained() needs to wrap q_proj/v_proj in lora.Linear
+    # (base_layer + lora_A/lora_B) — it only knows how to wrap standard
+    # module types (nn.Linear, nn.Embedding, Conv*, etc.), not an
+    # already-quantized DynamicQuantizedLinear. Quantizing first breaks
+    # this with "Target module DynamicQuantizedLinear(...) is not
+    # supported." Attaching first, then quantizing get_base_model()
+    # (which correctly targets q_proj.base_layer while excluding
+    # lora_A/lora_B via the same exclusion logic used everywhere else),
+    # matches the sequence actually used during training/recovery
+    # (prune -> attach/keep adapter -> apply QAT) and the order verified
+    # structurally in a minimal PEFT+LoRA test during development.
+    print(f"  [xQ-load] Attaching LoRA adapter (before quantization) ...")
+    model = PeftModel.from_pretrained(base, checkpoint_dir, is_trainable=False)
+
+    print(f"  [xQ-load] Quantizing base_layer (excluding lora_A/lora_B) — "
+          f"merge_and_unload() is not used: merging would add a float "
+          f"LoRA delta into the base's weight tensor, which has no "
+          f"defined meaning against a packed int8 representation. Base "
+          f"and adapter stay separate live modules; PEFT's own "
+          f"lora.Linear.forward() (base_layer(x) + "
+          f"lora_B(lora_A(x))*scaling) handles this with no other "
+          f"changes needed.")
+    quantized_base = _quantize_dynamic_matching_skeleton(model.get_base_model())
+    model.base_model.model = quantized_base
+
+    return model
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODEL LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -778,7 +989,7 @@ def load_model_for_inference(
     tokens_per_frame: int  = 1,
     fp16:             bool = True,
     saved_cfg:        Optional[Dict] = None,
-) -> Tuple[torch.nn.Module, WhisperProcessor]:
+) -> Tuple[torch.nn.Module, WhisperProcessor, torch.device]:
     """
     Load base model + LoRA merge (if applicable) to CPU, then move to device.
 
@@ -793,8 +1004,63 @@ def load_model_for_inference(
 
     PTQ quantization is applied AFTER this function via apply_quantization().
     No PTQ is applied here — this function loads at training precision only.
+
+    Returns (model, processor, device) — device is normally just the
+    input `device` echoed back, EXCEPT when saved_cfg["qat_converted"] is
+    true: a genuinely INT8-converted checkpoint (from finetune.py's
+    finalize_and_convert()) can only run on CPU (eager-mode dynamic
+    quantization has no CUDA kernels), so this function overrides
+    whatever device was requested and returns the actual device the
+    caller must use from here on for every subsequent op (dummy warmup
+    tensors, generate() calls, etc.) — using the original `device`
+    instead of this return value after calling this function is a bug.
     """
     saved_cfg  = saved_cfg or {}
+
+    # ── Genuinely quantized (converted) checkpoint: entirely different load
+    # path — none of the normal dtype/merge/strip-fake-quant/re-sparsify
+    # logic below applies to an already-converted model. ─────────────────────
+    if saved_cfg.get("qat_converted", False):
+        if device.type != "cpu":
+            print(f"  [xQ-load] Checkpoint is genuinely INT8-converted "
+                  f"(qat_converted=true) — overriding requested device "
+                  f"'{device}' to CPU. Eager-mode dynamic quantization has "
+                  f"no CUDA kernels; RTF/latency for this checkpoint are "
+                  f"NOT comparable to GPU-measured numbers elsewhere in "
+                  f"your tables without an explicit CPU-vs-GPU caveat.")
+        device = torch.device("cpu")
+
+        model_name = LOCAL_PATH[model_size]
+        processor  = WhisperProcessor.from_pretrained(
+            model_name, language="English", task="transcribe"
+        )
+        if checkpoint and os.path.exists(os.path.join(checkpoint, "tokenizer_config.json")):
+            from transformers import WhisperTokenizer
+            processor.tokenizer = WhisperTokenizer.from_pretrained(
+                checkpoint, language="English", task="transcribe"
+            )
+
+        sparsity_pattern = saved_cfg.get("sparsity_pattern", "dense")
+        if mode == "full":
+            assert checkpoint, "--checkpoint required for mode=full"
+            model = load_int8_converted_full(checkpoint, model_size)
+        elif mode == "lora":
+            assert checkpoint, "--checkpoint required for mode=lora"
+            model = load_int8_converted_lora(checkpoint, model_size, sparsity_pattern)
+        else:
+            raise ValueError(
+                f"qat_converted=true checkpoints only support mode in "
+                f"('full', 'lora'), got '{mode}'."
+            )
+
+        if tokens_per_frame > 1:
+            model = WhisperWithTokenSubsampling(model, tokens_per_frame)
+            print(f"  [xV] Subsampling: stride={tokens_per_frame} "
+                  f"→ {WHISPER_ENC_FRAMES // tokens_per_frame} encoder tokens.")
+
+        model = model.to(device).eval()
+        return model, processor, device
+
     model_name = LOCAL_PATH[model_size]
     is_distil  = model_size.startswith("distil-")
 
@@ -818,6 +1084,7 @@ def load_model_for_inference(
         model_name, language="English", task="transcribe"
     )
     if checkpoint and os.path.exists(os.path.join(checkpoint, "tokenizer_config.json")):
+
         from transformers import WhisperTokenizer
         processor.tokenizer = WhisperTokenizer.from_pretrained(
             checkpoint, language="English", task="transcribe"
@@ -912,7 +1179,7 @@ def load_model_for_inference(
     trainable    = sum(p.numel() for p in inner.parameters() if p.requires_grad)
     print(f"  Params  total={total_params:,}  trainable={trainable:,}")
 
-    return model, processor
+    return model, processor, device
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1334,13 +1601,19 @@ def run_evaluation(
         saved_cfg.setdefault("qat_mode", qat_mode)
 
     # ── 1. Load + clean (fake-quant removal + sparsity mask reapplication) ────
+    # NOTE: device may be OVERRIDDEN to CPU here if this checkpoint is
+    # genuinely INT8-converted (qat_converted=true) — eager-mode dynamic
+    # quantization has no CUDA kernels. Everything downstream (warmup,
+    # generate() calls, RTF measurement) must use this reassigned `device`,
+    # not whatever was passed in above.
     t0 = time.time()
-    model, processor = load_model_for_inference(
+    model, processor, device = load_model_for_inference(
         model_size=model_size, mode=mode, checkpoint=checkpoint,
         device=device, tokens_per_frame=tokens_per_frame, fp16=fp16,
         saved_cfg=saved_cfg,
     )
     load_s = round(time.time() - t0, 2)
+    qat_converted = saved_cfg.get("qat_converted", False)
 
     # ── 2. No PTQ applied — evaluate at training precision ────────────────────
     # PTQ removed per project decision. xQ axis is training-time only (QAT).
@@ -1384,8 +1657,17 @@ def run_evaluation(
     )
 
     # ── 6. Assemble result dict ───────────────────────────────────────────────
-    inner        = model.model if isinstance(model, WhisperWithTokenSubsampling) else model
-    total_params = sum(p.numel() for p in inner.parameters())
+    inner = model.model if isinstance(model, WhisperWithTokenSubsampling) else model
+    if qat_converted:
+        # .parameters() undercounts a quantize_dynamic()-converted model
+        # (packed weights live in an opaque _packed_params tuple, invisible
+        # to normal parameter iteration — same issue measure_model_size_mb
+        # works around above). Parameter COUNT doesn't change from
+        # quantization though — only the memory representation does — so
+        # the static architecture lookup is the correct source here.
+        total_params = WHISPER_PARAMS.get(model_size, (0, 0, 0))[0]
+    else:
+        total_params = sum(p.numel() for p in inner.parameters())
     enc_p        = WHISPER_PARAMS.get(model_size, (total_params, 0, 0))[1]
     dec_p        = WHISPER_PARAMS.get(model_size, (total_params, 0, 0))[2]
 
@@ -1408,6 +1690,9 @@ def run_evaluation(
             "python_version":     platform.python_version(),
             "torch_version":      torch.__version__,
             "torchaudio_version": torchaudio.__version__,
+            # Actual device this checkpoint ran on — may differ from the
+            # GPU reported in "gpu" below if qat_converted forced CPU.
+            "eval_device":        str(device),
         },
         "compression": {
             # xP: N:M sparsity (baked into weights from Stage 1/2 training)
@@ -1418,6 +1703,12 @@ def run_evaluation(
             "quantization_ptq":         quantization,
             # xQ: QAT (Stage 2, baked into checkpoint from training)
             "qat_mode_train":           qat_mode,
+            # True only when this checkpoint went through finetune.py's
+            # finalize_and_convert() and is running as a GENUINELY
+            # quantized model (real int8 weights) rather than a plain
+            # float checkpoint that happened to be QAT-trained. Ran on
+            # CPU if true — see run_info.eval_device.
+            "qat_converted":            qat_converted,
             "model_size_mb":            model_size_mb,
             "bytes_per_param_theoretical": PRECISION_BYTES.get(quantization, 2),
         },
