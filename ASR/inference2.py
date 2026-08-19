@@ -1,5 +1,5 @@
 """
-inference.py — Inference Evaluation for Whisper ASR
+inference2.py — Inference Evaluation for Whisper ASR
 =======================================================================
 Compatible with whisper_finetune.py — handles:
   - Plain WhisperForConditionalGeneration  (mode=baseline / mode=full)
@@ -864,10 +864,8 @@ def load_int8_converted_full(checkpoint_dir: str, model_size: str) -> torch.nn.M
     """
     print(f"  [xQ-load] Rebuilding INT8-converted skeleton for mode=full "
           f"checkpoint: {checkpoint_dir}")
-    _cfg_source = checkpoint_dir if os.path.exists(
-        os.path.join(checkpoint_dir, "config.json")) else LOCAL_PATH[model_size]
     skeleton = WhisperForConditionalGeneration.from_pretrained(
-        _cfg_source, torch_dtype=torch.float32, low_cpu_mem_usage=False,
+        LOCAL_PATH[model_size], torch_dtype=torch.float32, low_cpu_mem_usage=False,
     )
     skeleton.config.forced_decoder_ids         = None
     skeleton.generation_config.suppress_tokens = []

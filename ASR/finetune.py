@@ -588,8 +588,9 @@ class NMSparseCallback:
 class _Int4FakeQuantize(torch.quantization.FakeQuantize):
     """
     4-bit fake-quantize observer.
-    Symmetric, per-tensor, 16 quantization levels ([-7, 7] for signed INT4).
-    Used for INT4 QAT to simulate 4-bit weight noise during training.
+    Symmetric, PER-CHANNEL, 16 quantization levels ([-8, 7] for signed
+    INT4).  Used for INT4 QAT to simulate 4-bit weight noise during
+    training.
 
     Accepts and swallows **kwargs (in particular `factory_kwargs`): newer
     torch.ao.quantization.prepare_qat() passes device/dtype hints to every
@@ -598,15 +599,31 @@ class _Int4FakeQuantize(torch.quantization.FakeQuantize):
     "_Int4FakeQuantize.__init__() got an unexpected keyword argument
     'factory_kwargs'" on every INT4 run and silently fall back to the
     manual fake-quant insertion path instead of the tested, official one.
+
+    PER-CHANNEL, not per-tensor: this was a real bug, found and fixed
+    after the fact — the INT8 weight-only fix (see apply_qat's docstring)
+    switched INT8 to per-channel quantization but INT4 was never checked
+    and was left on MovingAverageMinMaxObserver, the per-TENSOR variant.
+    This matters far more at 4 bits than at 8: per-tensor forces every
+    output channel to share one scale calibrated to the whole tensor's
+    max, so channels with smaller natural magnitude get crushed toward
+    very few of the 16 available levels while only the single
+    largest-magnitude channel gets full resolution. At INT8's 256 levels
+    there's enough headroom that this mostly doesn't matter; at INT4's 16
+    levels there's almost no slack to lose. Per-channel scales each
+    output channel independently, avoiding this. Verified
+    MovingAveragePerChannelMinMaxObserver exists and is usable with the
+    same construction pattern before making this change.
     """
     def __init__(self, **kwargs):
         kwargs.pop("factory_kwargs", None)
         super().__init__(
-            observer=torch.quantization.MovingAverageMinMaxObserver,
+            observer=torch.quantization.MovingAveragePerChannelMinMaxObserver,
             quant_min=-8,
             quant_max=7,
             dtype=torch.qint8,       # closest supported dtype; levels limited below
-            qscheme=torch.per_tensor_symmetric,
+            qscheme=torch.per_channel_symmetric,
+            ch_axis=0,
             reduce_range=False,
         )
         # Override bit-width to 4 by clamping the effective range
