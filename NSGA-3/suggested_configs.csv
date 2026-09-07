@@ -1,0 +1,11 @@
+xN_model,xT_input_length,xV_resolution,xR_lora_rank,xQ_quantization,xP_pruning,wer,flops,memory
+Medium,750 Frames,2,r=64,QAT-INT4,2:4,,,
+Small,750 Frames,2,r=64,QAT-INT4,1:4,,,
+Large-v3,1500 Frames,1,r=64,QAT-FP16,1:4,,,
+Medium Distil,1500 Frames,2,r=8,QAT-INT4,dense,,,
+Large-v3,750 Frames,2,r=64,QAT-INT4,2:4,,,
+Large-v3 Distil,750 Frames,1,r=64,QAT-FP32,1:4,,,
+Small Distil,1500 Frames,2,No Lora,QAT-INT8,dense,,,
+Large-v3 Distil,750 Frames,2,No Lora,QAT-FP32,1:4,,,
+Small Distil,750 Frames,2,No Lora,QAT-FP32,1:4,,,
+Medium,750 Frames,2,r=64,QAT-INT4,1:4,,,
