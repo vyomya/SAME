@@ -1549,6 +1549,31 @@ def _find_latest_checkpoint(output_dir: str) -> Optional[str]:
     return candidates[-1][1]
 
 
+def _print_cache_files(dataset, label: str) -> None:
+    """
+    Report which on-disk arrow cache file(s) actually back this dataset
+    object. Every non-streaming HF `Dataset` (never IterableDataset,
+    which is streamed and doesn't write this kind of cache at all)
+    exposes exactly this via `.cache_files` -- whether that entry points
+    at a cache load_dataset()/map() just WROTE this run, or one it found
+    and REUSED from a previous run, is the same field either way, so
+    this also doubles as a quick way to tell "did this actually
+    re-tokenize everything, or did it just reuse what's already there."
+    """
+    cache_files = getattr(dataset, "cache_files", None)
+    if not cache_files:
+        print(f"  [cache] {label}: no on-disk cache file (streaming, or "
+              f"in-memory dataset).")
+        return
+    print(f"  [cache] {label}: {len(cache_files)} cache file(s):")
+    for entry in cache_files:
+        path = entry.get("filename", entry) if isinstance(entry, dict) else entry
+        exists = os.path.exists(path) if isinstance(path, str) else "?"
+        size_mb = (round(os.path.getsize(path) / (1024 ** 2), 1)
+                   if isinstance(path, str) and exists is True else "?")
+        print(f"    {path}  (exists={exists}, {size_mb} MB)")
+
+
 def _load_and_preprocess_datasets(args):
     """Shared dataset-loading/preprocessing logic used by both train() and
     prune_and_recover(), so the recovery run sees exactly the same data
@@ -1581,6 +1606,8 @@ def _load_and_preprocess_datasets(args):
         benchmark, eval_split,
         streaming=streaming, max_samples=max_eval_samples,
     )
+    _print_cache_files(train_dataset, f"raw train ({train_split})")
+    _print_cache_files(eval_dataset,  f"raw eval ({eval_split})")
 
     print("Preprocessing datasets...")
     train_dataset = apply_preprocessing(
@@ -1595,6 +1622,9 @@ def _load_and_preprocess_datasets(args):
         tokens_per_frame=tokens_per_frame, total_frames=total_frames,
         num_proc=args.num_proc if not streaming else 1,
     )
+    _print_cache_files(train_dataset, "preprocessed train (.map() output)")
+    _print_cache_files(eval_dataset,  "preprocessed eval (.map() output)")
+
     return processor, train_dataset, eval_dataset
 
 
