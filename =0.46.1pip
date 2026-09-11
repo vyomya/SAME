@@ -1,0 +1,2 @@
+Defaulting to user installation because normal site-packages is not writeable
+Requirement already satisfied: bitsandbytes in /nfshomes/vyomwal5/.local/lib/python3.9/site-packages (0.48.2)

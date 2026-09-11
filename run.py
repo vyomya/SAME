@@ -1,62 +1,4 @@
-"""
-run_experiment.py — Experiment launcher for Whisper finetuning
-===============================================================
 
-This script owns the high-level experiment axes:
-  --task              downstream task           (asr | translation)
-  --benchmark_dataset benchmark to train/eval on (librispeech | common_voice | fleurs | voxpopuli)
-  --llm_size          Whisper model size         (tiny | base | small | medium | large-v3)
-  --tokens_per_frame  LM tokens per encoder frame (affects max label length)
-  --total_frames      encoder output frames for max-length audio clip
-
-Everything else is passed through as raw vargs after `--` and forwarded
-directly to whisper_finetune.py's argument parser.
-
-Design rationale
-----------------
-Keeping the two parsers separate means:
-  - run_experiment.py is clean and declarative (what experiment to run)
-  - whisper_finetune.py is fully self-contained (how to run it)
-  - You can still call whisper_finetune.py directly without this launcher
-  - vargs let you override ANY whisper_finetune argument without touching this file
-
-Usage
------
-  # Basic: ASR on LibriSpeech, small model, LoRA (all other args use defaults)
-  python run_experiment.py \\
-      --task asr \\
-      --benchmark_dataset librispeech \\
-      --llm_size small \\
-      --tokens_per_frame 1 \\
-      --total_frames 1500
-
-  # Override whisper_finetune args via vargs (after --)
-  python run_experiment.py \\
-      --task asr \\
-      --benchmark_dataset common_voice \\
-      --llm_size medium \\
-      --tokens_per_frame 2 \\
-      --total_frames 1500 \\
-      -- --mode full --batch_size 8 --lora_r 64 --max_steps 2000 --output_dir ./my_runs
-
-  # Eval only from a saved checkpoint
-  python run_experiment.py \\
-      --task asr \\
-      --benchmark_dataset librispeech \\
-      --llm_size large-v3 \\
-      --tokens_per_frame 1 \\
-      --total_frames 1500 \\
-      -- --eval_only --checkpoint ./checkpoints/whisper-large-v3-lora-librispeech-asr
-
-  # Sweep over all sizes × modes
-  python run_experiment.py \\
-      --task asr \\
-      --benchmark_dataset librispeech \\
-      --llm_size small \\
-      --tokens_per_frame 1 \\
-      --total_frames 1500 \\
-      -- --sweep --sweep_sizes small,medium,large-v3 --sweep_modes full,lora
-"""
 
 import sys
 import argparse
@@ -64,18 +6,10 @@ import argparse
 # Import whisper_finetune as a module (avoids subprocess, shares process memory)
 import ASR.finetune as wf
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VALID VALUES (mirrors whisper_finetune constants for validation)
-# ─────────────────────────────────────────────────────────────────────────────
 VALID_TASKS      = wf.SUPPORTED_TASKS
 VALID_BENCHMARKS = list(wf.BENCHMARK_REGISTRY.keys())
 VALID_SIZES      = list(wf.WHISPER_SIZES.keys())
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ARGUMENT PARSER — only the high-level experiment axes
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_launcher_args():
     p = argparse.ArgumentParser(
@@ -161,10 +95,6 @@ def parse_launcher_args():
     return launcher_args, vargs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
 def tokens_per_frame_explanation(tokens_per_frame: int, total_frames: int) -> str:
     """Return a human-readable explanation of the derived label budget."""
     derived = tokens_per_frame * total_frames
@@ -200,10 +130,6 @@ def build_finetune_argv(launcher_args, vargs: list) -> list:
 
     return base + vargs_clean
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     launcher_args, vargs = parse_launcher_args()
