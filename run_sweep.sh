@@ -11,13 +11,13 @@
 cd /home/mokshdag/SAME
 
 # ── xN: smaller model ──────────────────────────────────────────────────────
-echo "=== xN: wav2vec2-base ==="
-python run_emotion_experiment.py \
-    --benchmark_dataset cremad \
-    --llm_name facebook/wav2vec2-base \
-    --max_audio_len 4.0 \
-    -- --mode lora --max_steps 3000 --eval_steps 300 \
-       --output_dir /home/mokshdag/checkpoints/
+# echo "=== xN: wav2vec2-base ==="
+# python run_emotion_experiment.py \
+#     --benchmark_dataset cremad \
+#     --llm_name facebook/wav2vec2-base \
+#     --max_audio_len 4.0 \
+#     -- --mode lora --max_steps 3000 --eval_steps 300 \
+#        --output_dir /home/mokshdag/checkpoints/
 
 # ── LoRA rank sweep ────────────────────────────────────────────────────────
 for RANK in 8 32 64; do

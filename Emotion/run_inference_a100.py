@@ -17,7 +17,7 @@ LABEL_NAMES      = ["neutral", "happy", "sad", "angry", "fear", "disgust"]
 SAMPLING_RATE    = 16_000
 AUDIO_DIR        = f"{CACHE_DIR}/datasets/crema-d/data/data/AudioWAV"
 CHECKPOINTS_DIR  = "/scratch/zt1/project/msml605/user/mokshdag/checkpoints/checkpoints/"
-OUTPUT_JSON      = "/scratch/zt1/project/msml605/user/mokshdag/inference_results/all_inference_results_h100.json"
+OUTPUT_JSON      = "/scratch/zt1/project/msml605/user/mokshdag/inference_results/all_inference_results_a100.json"
 
 os.makedirs(os.path.dirname(OUTPUT_JSON), exist_ok=True)
 device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
